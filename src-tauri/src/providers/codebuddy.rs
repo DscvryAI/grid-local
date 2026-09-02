@@ -993,12 +993,16 @@ mod tests {
     /// prevent path-traversal-style reads of arbitrary directories on disk.
     #[test]
     fn load_sessions_rejects_path_outside_codebuddy_root() {
-        // /tmp definitely exists on macOS/Linux and is outside the codebuddy
-        // root. The function checks existence first, so we need a real path.
-        let result = load_sessions("/tmp", false);
-        // Either errors with the "outside" message, or — if /tmp doesn't
-        // canonicalize on this platform — errors with a canonicalize message.
-        // Both are acceptable; what we want to guard against is `Ok(...)`.
+        // `load_sessions` returns `Ok(vec![])` for a path that doesn't exist
+        // at all -- the containment check only runs once existence is
+        // confirmed. A hardcoded "/tmp" is unreliable as "a path that exists
+        // and is outside the root": whether it exists depends on incidental
+        // machine state (on Windows it resolves relative to the current
+        // drive, and isn't guaranteed to be there). Use a real TempDir
+        // instead, so this test exercises the actual containment check
+        // rather than the unrelated does-it-exist branch.
+        let outside_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let result = load_sessions(&outside_dir.path().to_string_lossy(), false);
         assert!(
             result.is_err(),
             "path outside codebuddy root must error, got: {result:?}"

@@ -29,7 +29,7 @@
 //! `conversations/<uuid>.db` protobuf SQLite, `implicit/*.pb`,
 //! per-conversation markdown, `scratch/`) are intentionally NOT parsed.
 
-use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession};
+use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession, TokenUsage};
 use crate::utils::{build_provider_message, is_symlink, search_json_value_case_insensitive};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -492,7 +492,7 @@ fn convert_step(
 
     if source == "USER_EXPLICIT" || step_type == "USER_INPUT" {
         let content = content?;
-        return Some(build_provider_message(
+        let mut message = build_provider_message(
             PROVIDER_ID,
             uuid,
             conversation_id,
@@ -501,7 +501,16 @@ fn convert_step(
             Some("user"),
             Some(json!([{ "type": "text", "text": content }])),
             None,
-        ));
+        );
+        // The stats layer treats a usage-less "antigravity" user message as
+        // a desktop-only synthesized placeholder prompt and excludes it --
+        // correct for the desktop app, but every genuine CLI message is
+        // usage-less too (the CLI has no external usage log to attach), so
+        // that check would wrongly drop real CLI turns. A present-but-empty
+        // `TokenUsage` marks this as a real message with simply no token
+        // data available, not a synthesized one.
+        message.usage = Some(TokenUsage::default());
+        return Some(message);
     }
 
     if source == "MODEL" {
