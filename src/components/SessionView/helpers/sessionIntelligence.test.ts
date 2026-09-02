@@ -211,6 +211,32 @@ describe("extractFileEvents", () => {
     ];
     expect(extractFileEvents(getAllToolUseBlocks(messages))).toHaveLength(0);
   });
+
+  it("parses every file path out of a Codex apply_patch call, including multi-file patches", () => {
+    const patch = [
+      "*** Begin Patch",
+      "*** Update File: src/a.ts",
+      "@@",
+      "-old",
+      "+new",
+      "*** Add File: src/b.ts",
+      "+content",
+      "*** Delete File: src/c.ts",
+      "*** End Patch",
+    ].join("\n");
+    const messages = [
+      assistantMessage({
+        uuid: "a",
+        timestamp: "2026-08-01T00:00:00.000Z",
+        content: [{ type: "tool_use", id: "1", name: "apply_patch", input: { patch } }],
+      }),
+    ];
+    const events = extractFileEvents(getAllToolUseBlocks(messages));
+
+    expect(events).toHaveLength(3);
+    expect(events.map((e) => e.filePath).sort()).toEqual(["src/a.ts", "src/b.ts", "src/c.ts"]);
+    expect(events[0].tools).toEqual(["apply_patch"]);
+  });
 });
 
 describe("calculateTokenBreakdown", () => {

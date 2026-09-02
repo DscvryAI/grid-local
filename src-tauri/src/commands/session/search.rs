@@ -311,7 +311,13 @@ fn has_file_changes(message: &ClaudeMessage) -> bool {
 
         matches!(
             item.get("name").and_then(serde_json::Value::as_str),
-            Some("Write" | "Edit" | "MultiEdit" | "NotebookEdit")
+            // "apply_patch" is Codex CLI's own file-editing tool -- it keeps
+            // its native name (unlike other providers' write/edit tools,
+            // which get normalized to these Claude names) because its input
+            // is a raw multi-file patch, not a single `file_path` + content,
+            // so it can't share the Write/Edit renderers. It still needs to
+            // count as a file change here.
+            Some("Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "apply_patch")
         )
     })
 }
@@ -652,6 +658,27 @@ mod tests {
         format!(
             r#"{{"uuid":"{uuid}","sessionId":"{session_id}","timestamp":"2025-06-26T10:02:00Z","type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"{visible}"}}]}},"toolUseResult":{{"stdout":"{result_stdout}","stderr":"","interrupted":false}}}}"#
         )
+    }
+
+    #[test]
+    fn has_file_changes_recognizes_codex_apply_patch() {
+        let message: ClaudeMessage = serde_json::from_str(
+            r#"{"uuid":"u1","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","type":"assistant","content":[{"type":"tool_use","id":"t1","name":"apply_patch","input":{"patch":"*** Begin Patch\n*** Update File: a.rs\n*** End Patch"}}]}"#,
+        )
+        .expect("valid message");
+        assert!(
+            has_file_changes(&message),
+            "apply_patch is Codex's own file-editing tool and must count as a file change"
+        );
+    }
+
+    #[test]
+    fn has_file_changes_ignores_read_only_tools() {
+        let message: ClaudeMessage = serde_json::from_str(
+            r#"{"uuid":"u1","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","type":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.rs"}}]}"#,
+        )
+        .expect("valid message");
+        assert!(!has_file_changes(&message));
     }
 
     #[tokio::test]

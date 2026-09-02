@@ -203,7 +203,17 @@ export function summarizeToolUsage(occurrences: ToolUseOccurrence[]): ToolUsageS
 // Files touched
 // ============================================================================
 
-const FILE_WRITING_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+const FILE_WRITING_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch"]);
+
+/** Matches a `*** Update/Add/Delete File: <path>` header line from Codex
+ * CLI's `apply_patch` format, which can touch several files in one call. */
+const APPLY_PATCH_FILE_HEADER = /^\*\*\* (?:Update|Add|Delete) File: (.+)$/gm;
+
+function extractApplyPatchFilePaths(patch: string): string[] {
+  return Array.from(patch.matchAll(APPLY_PATCH_FILE_HEADER), (m) => (m[1] ?? "").trim()).filter(
+    (path) => path.length > 0
+  );
+}
 
 /** One individual write-tool touch of a file -- the real, ordered change
  * lifecycle behind selecting a file, not just an aggregate count. */
@@ -225,34 +235,50 @@ export interface FileEvent {
 
 /**
  * Distinct files touched by a write-capable tool (`Write`/`Edit`/
- * `MultiEdit`/`NotebookEdit` -- the same tool-name set the backend's
- * `has_file_changes` check uses), keyed on `input.file_path` (the field
- * name every such tool's renderer already reads, e.g.
- * `MultiEditToolRenderer.tsx`).
+ * `MultiEdit`/`NotebookEdit`, keyed on `input.file_path` -- the field name
+ * every such tool's renderer already reads, e.g. `MultiEditToolRenderer.tsx`
+ * -- plus Codex CLI's `apply_patch`, which keeps its native name and input
+ * shape (a raw multi-file patch, no `file_path` field) so it can share the
+ * dedicated diff-highlighted renderer; its file path(s) are parsed out of
+ * the patch text instead. Same tool-name set the backend's
+ * `has_file_changes` check uses.
  */
 export function extractFileEvents(occurrences: ToolUseOccurrence[]): FileEvent[] {
   const events = new Map<string, FileEvent>();
-  for (const { message, tool } of occurrences) {
-    if (!FILE_WRITING_TOOLS.has(tool.name)) continue;
-    const filePath = typeof tool.input.file_path === "string" ? tool.input.file_path : null;
-    if (!filePath) continue;
 
-    const touch: FileTouch = { tool: tool.name, timestamp: message.timestamp };
+  const recordTouch = (filePath: string, toolName: string, timestamp: string) => {
+    const touch: FileTouch = { tool: toolName, timestamp };
     const existing = events.get(filePath);
     if (existing) {
       existing.count += 1;
-      if (!existing.tools.includes(tool.name)) existing.tools.push(tool.name);
-      if (message.timestamp > existing.lastTouched) existing.lastTouched = message.timestamp;
+      if (!existing.tools.includes(toolName)) existing.tools.push(toolName);
+      if (timestamp > existing.lastTouched) existing.lastTouched = timestamp;
       existing.touches.push(touch);
     } else {
       events.set(filePath, {
         filePath,
-        tools: [tool.name],
+        tools: [toolName],
         count: 1,
-        lastTouched: message.timestamp,
+        lastTouched: timestamp,
         touches: [touch],
       });
     }
+  };
+
+  for (const { message, tool } of occurrences) {
+    if (!FILE_WRITING_TOOLS.has(tool.name)) continue;
+
+    if (tool.name === "apply_patch") {
+      const patch = typeof tool.input.patch === "string" ? tool.input.patch : "";
+      for (const filePath of extractApplyPatchFilePaths(patch)) {
+        recordTouch(filePath, tool.name, message.timestamp);
+      }
+      continue;
+    }
+
+    const filePath = typeof tool.input.file_path === "string" ? tool.input.file_path : null;
+    if (!filePath) continue;
+    recordTouch(filePath, tool.name, message.timestamp);
   }
   for (const event of events.values()) {
     event.touches.sort((a, b) => (a.timestamp < b.timestamp ? -1 : 1));

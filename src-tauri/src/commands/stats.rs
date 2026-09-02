@@ -3179,28 +3179,36 @@ fn get_provider_session_comparison(
         let mut all_sessions: Vec<SessionComparisonStats> = Vec::new();
 
         for session in &sessions {
-            let Some((stats, _records)) = build_antigravity_session_token_stats(
+            // A date filter that excludes every message in this session
+            // means zero stats for this range, not that the session
+            // doesn't exist -- still record it (as zero) so a lookup by id
+            // below can find it rather than reporting "not found" for a
+            // session that just has no data in the current range.
+            let stats = build_antigravity_session_token_stats(
                 session,
                 mode,
                 s_limit.as_ref(),
                 e_limit.as_ref(),
-            )?
-            else {
-                continue;
-            };
+            )?;
 
-            let duration_seconds = match (
-                parse_timestamp_utc(&stats.first_message_time),
-                parse_timestamp_utc(&stats.last_message_time),
-            ) {
-                (Some(first), Some(last)) => (last - first).num_seconds(),
-                _ => 0,
+            let (total_tokens, message_count, duration_seconds) = match stats {
+                Some((stats, _records)) => {
+                    let duration_seconds = match (
+                        parse_timestamp_utc(&stats.first_message_time),
+                        parse_timestamp_utc(&stats.last_message_time),
+                    ) {
+                        (Some(first), Some(last)) => (last - first).num_seconds(),
+                        _ => 0,
+                    };
+                    (stats.total_tokens, stats.message_count, duration_seconds)
+                }
+                None => (0, 0, 0),
             };
 
             all_sessions.push(SessionComparisonStats {
                 session_id: session.actual_session_id.clone(),
-                total_tokens: stats.total_tokens,
-                message_count: stats.message_count,
+                total_tokens,
+                message_count,
                 duration_seconds,
             });
         }
@@ -3310,10 +3318,11 @@ fn get_provider_session_comparison(
                 }
             }
         }
-        if included_message_count == 0 {
-            continue;
-        }
-
+        // A date filter that excludes every message in this session means
+        // zero stats for this range, not that the session doesn't exist --
+        // still record it (as zero) rather than `continue`, so a lookup
+        // by id below can find it instead of reporting "not found" for a
+        // session that just has no data in the current range.
         let duration_seconds = match (first_time.as_ref(), last_time.as_ref()) {
             (Some(first), Some(last)) => (*last - *first).num_seconds(),
             _ => 0,
@@ -4114,6 +4123,16 @@ fn scan_session_file_for_comparison(
             continue;
         };
 
+        // Identity is captured from the first parseable message
+        // unconditionally, before any date-filter/mode-inclusion check --
+        // a session's own existence shouldn't depend on whether any of its
+        // messages happen to fall inside the current date range (a date
+        // filter that excludes everything means zero stats for this
+        // range, not "this session doesn't exist").
+        if session_id.is_none() {
+            session_id = Some(message.session_id.clone());
+        }
+
         let usage = extract_token_usage(&message);
         let has_usage = token_usage_has_token_fields(&usage);
         if !should_include_stats_entry(&message.message_type, message.is_sidechain, has_usage, mode)
@@ -4125,10 +4144,6 @@ fn scan_session_file_for_comparison(
         let parsed_ts = parse_timestamp_utc(&message.timestamp);
         if !is_within_date_limits(parsed_ts, s_limit, e_limit) {
             continue;
-        }
-
-        if session_id.is_none() {
-            session_id = Some(message.session_id.clone());
         }
 
         message_count += 1;
@@ -7073,15 +7088,24 @@ mod tests {
         assert_eq!(comparison.session_id, "s-b");
         assert_eq!(comparison.rank_by_tokens, 1);
 
-        let filtered_out = get_session_comparison(
+        // s-a has no messages in this window, but it's a real session in
+        // the project -- a date filter with no matching data means zero
+        // stats for that range, not "session not found" (the actual bug
+        // reported in production: opening comparison for a session whose
+        // messages fell outside whatever date filter happened to be
+        // active surfaced this exact error for a session that plainly
+        // existed).
+        let filtered_out_of_range = get_session_comparison(
             "s-a".to_string(),
             project_path,
             Some("2025-01-02T00:00:00Z".to_string()),
             Some("2025-01-02T23:59:59.999Z".to_string()),
             Some("billing_total".to_string()),
         )
-        .await;
-        assert!(filtered_out.is_err());
+        .await
+        .expect("a session with no data in range must still be found, not error");
+        assert_eq!(filtered_out_of_range.session_id, "s-a");
+        assert!(!filtered_out_of_range.is_above_average);
     }
 
     #[tokio::test]

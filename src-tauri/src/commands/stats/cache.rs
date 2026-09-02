@@ -881,6 +881,26 @@ fn first_included_session_id<'a>(
     best.map(|(_, session_id)| session_id)
 }
 
+/// Session id of the first row in file order across the WHOLE file,
+/// ignoring any date filter -- a session's own identity shouldn't depend
+/// on whether its messages happen to fall inside the currently-selected
+/// date range. Used for "does this session exist" lookups (comparison),
+/// as opposed to `first_included_session_id`, which is correct for
+/// "what session data falls in this range" (single-session stats, where
+/// no data in range legitimately means an empty result, not a missing
+/// session).
+fn any_session_id(aggregate: &FileAggregate) -> Option<&str> {
+    let mut best: Option<(u64, &str)> = None;
+    for bucket in aggregate.days.values().chain(std::iter::once(&aggregate.undated)) {
+        if let Some(session_id) = &bucket.first_session_id {
+            if best.map_or(true, |(seq, _)| bucket.first_row_seq < seq) {
+                best = Some((bucket.first_row_seq, session_id));
+            }
+        }
+    }
+    best.map(|(_, session_id)| session_id)
+}
+
 /// Compose the global-stats per-file result from the cached aggregate.
 pub(super) fn compose_global(
     aggregate: &FileAggregate,
@@ -1186,7 +1206,11 @@ pub(super) fn compose_comparison(
     let Some(selection) = included_buckets(aggregate, s_limit, e_limit) else {
         return Composed::NeedsFullScan;
     };
-    let Some(session_id) = first_included_session_id(&selection, &aggregate.undated) else {
+    // Identity is resolved from the whole file, not the filtered selection
+    // -- a date filter with no matching rows for this session means "zero
+    // stats for this range", not "this session doesn't exist" (see
+    // `any_session_id`'s doc comment).
+    let Some(session_id) = any_session_id(aggregate) else {
         return Composed::Ready(None);
     };
 
