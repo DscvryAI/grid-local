@@ -44,7 +44,7 @@
     "@tauri-apps/plugin-process": "2.3.1",
     "@tauri-apps/plugin-store": "2.4.3",
     "@tauri-apps/plugin-updater": "2.10.1",
-    "@types/prismjs": "^1.26.5",
+    "@types/prismjs": "^1.26.6",
     "ansi-to-html": "^0.7.2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
