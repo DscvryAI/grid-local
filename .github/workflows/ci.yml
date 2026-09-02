@@ -1,10 +1,16 @@
 name: CI
 
-# Windows + macOS gates only -- Grid Local is a Windows/macOS desktop
-# app, and neither job here runs a full `tauri build` (a native
-# installer build is a separate, heavier concern than "does the code
-# compile/lint/test cleanly"); the frontend job runs `vite build`
-# (`pnpm build`'s own `tsc && vite build`) as the frontend build gate.
+# Windows-only for now -- GitHub Actions bills macOS runners at 10x the
+# Linux per-minute rate (Windows is 2x), and macOS jobs here run
+# ~20-90 minutes each; that multiplier made a handful of debugging
+# runs burn through a whole month's included minutes. Grid Local is
+# also a Windows/macOS desktop app, but Windows is the actual dev
+# platform this codebase is built and tested on day to day. Re-add a
+# macOS leg once there's budget/cause to justify the cost -- neither
+# job here runs a full `tauri build` (a native installer build is a
+# separate, heavier concern than "does the code compile/lint/test
+# cleanly"); the frontend job runs `vite build` (`pnpm build`'s own
+# `tsc && vite build`) as the frontend build gate.
 on:
   push:
     branches: [main]
@@ -21,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -43,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
