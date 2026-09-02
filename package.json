@@ -34,7 +34,7 @@
     "@radix-ui/react-switch": "^1.2.6",
     "@radix-ui/react-tabs": "^1.1.13",
     "@radix-ui/react-tooltip": "^1.2.7",
-    "@tailwindcss/typography": "^0.5.16",
+    "@tailwindcss/typography": "^0.5.20",
     "@tailwindcss/vite": "^4.1.11",
     "@tanstack/react-virtual": "^3.0.0",
     "@tauri-apps/api": "2.11.0",
