@@ -1,0 +1,129 @@
+/**
+ * Session Types
+ *
+ * Project and session structures, app state, and search filters.
+ */
+
+import type { ClaudeMessage, PaginationState } from "./message.types";
+import type { SessionTokenStats } from "./stats.types";
+import type { AppError } from "./error.types";
+
+// ============================================================================
+// Git Types
+// ============================================================================
+
+export type GitWorktreeType = "main" | "linked" | "not_git";
+
+export interface GitInfo {
+  /** 워크트리 유형 */
+  worktree_type: GitWorktreeType;
+  /** 메인 레포의 프로젝트 경로 (링크드 워크트리인 경우) */
+  main_project_path?: string;
+}
+
+export interface GitCommit {
+  hash: string;
+  author: string;
+  date: string;
+  message: string;
+  timestamp: number;
+}
+
+// ============================================================================
+// Project & Session
+// ============================================================================
+
+/** The last-known project path no longer exists on this machine. */
+export type ProjectPathStatus = "unavailable";
+
+export interface ClaudeProject {
+  name: string;
+  /** Claude session storage path (e.g., "~/.claude/projects/-Users-jack-client-my-project") */
+  path: string;
+  /** Decoded actual filesystem path (e.g., "/Users/jack/client/my-project") */
+  actual_path: string;
+  session_count: number;
+  message_count: number;
+  last_modified: string;
+  /** Path-dependent actions are unavailable while the last-known path is missing. */
+  path_status?: ProjectPathStatus;
+  /** Git worktree 정보 */
+  git_info?: GitInfo;
+}
+
+export interface ClaudeSession {
+  session_id: string; // Unique ID based on file path
+  actual_session_id: string; // Actual session ID from the messages
+  file_path: string; // JSONL file full path
+  project_name: string;
+  message_count: number;
+  first_message_time: string;
+  last_message_time: string;
+  last_modified: string; // File last modified time
+  has_tool_use: boolean;
+  has_errors: boolean;
+  summary?: string;
+  relevance?: number;
+  /** Originating Claude Code client (raw JSONL `entrypoint` value). */
+  entrypoint?: string;
+}
+
+// ============================================================================
+// SubAgent Session
+// ============================================================================
+
+export interface SubagentSession {
+  agent_id: string;
+  file_path: string;
+  message_count: number;
+  file_size: number;
+  first_message_time: string | null;
+  last_message_time: string | null;
+  summary: string | null;
+  /** Task tool_use id that spawned this subagent (from agent-<id>.meta.json); null for older sessions. */
+  tool_use_id: string | null;
+  /** Workflow run this agent belongs to (wf_… dir under subagents/workflows/); null for flat subagents. */
+  workflow_run_id: string | null;
+}
+
+// ============================================================================
+// Search Filters
+// ============================================================================
+
+export interface SearchFilters {
+  dateRange?: [Date, Date];
+  projects?: string[];
+  messageType?: "user" | "assistant" | "all";
+  hasToolCalls?: boolean;
+  hasErrors?: boolean;
+  hasFileChanges?: boolean;
+}
+
+// ============================================================================
+// Application State
+// ============================================================================
+
+export interface AppState {
+  claudePath: string;
+  projects: ClaudeProject[];
+  selectedProject: ClaudeProject | null;
+  sessions: ClaudeSession[];
+  sessionsTotal: number;
+  sessionsOffset: number;
+  hasMoreSessions: boolean;
+  selectedSession: ClaudeSession | null;
+  messages: ClaudeMessage[];
+  pagination: PaginationState;
+  searchQuery: string;
+  searchResults: ClaudeMessage[];
+  searchFilters: SearchFilters;
+  isLoading: boolean; // App initialization
+  isLoadingProjects: boolean;
+  isLoadingSessions: boolean;
+  isLoadingMoreSessions: boolean;
+  isLoadingMessages: boolean;
+  isLoadingTokenStats: boolean;
+  error: AppError | null;
+  sessionTokenStats: SessionTokenStats | null;
+  projectTokenStats: SessionTokenStats[];
+}

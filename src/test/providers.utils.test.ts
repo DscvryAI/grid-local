@@ -1,0 +1,244 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  DEFAULT_PROVIDER_ID,
+  PROVIDER_IDS,
+  calculateConversationBreakdownCoverage,
+  getProviderId,
+  getProviderLabel,
+  getResumeCommand,
+  getWslSearchableProviderIds,
+  hasAnyConversationBreakdownProvider,
+  hasNonDefaultProvider,
+  normalizeProviderIds,
+  supportsConversationBreakdown,
+  supportsNativeRename,
+  supportsSessionDeletion,
+} from "@/utils/providers";
+
+describe("providers utils", () => {
+  it("normalizes provider ids by canonical order", () => {
+    const ids = normalizeProviderIds(["opencode", "kimi", "claude", "opencode"]);
+    expect(ids).toEqual(["claude", "kimi", "opencode"]);
+  });
+
+  it("falls back to default provider for unknown values", () => {
+    expect(getProviderId(undefined)).toBe(DEFAULT_PROVIDER_ID);
+    expect(getProviderId("invalid")).toBe(DEFAULT_PROVIDER_ID);
+  });
+
+  it("returns localized provider label", () => {
+    const translate = (key: string, fallback: string) => `${key}:${fallback}`;
+    expect(getProviderLabel(translate, "codex")).toBe(
+      "common.provider.codex:Codex CLI"
+    );
+  });
+
+  it("detects non-default provider selection", () => {
+    expect(hasNonDefaultProvider(["claude"])).toBe(false);
+    expect(hasNonDefaultProvider(["claude", "opencode"])).toBe(true);
+  });
+
+  it("selects only providers with WSL search routing", () => {
+    expect(getWslSearchableProviderIds(["claude", "codex", "copilot", "gemini"])).toEqual([
+      "claude",
+      "copilot",
+    ]);
+  });
+
+  it("keeps provider id list stable for all known providers", () => {
+    expect(PROVIDER_IDS).toEqual([
+      "aider",
+      "amazonq",
+      "antigravity",
+      "claude",
+      "cline",
+      "codebuddy",
+      "codex",
+      "continue",
+      "copilot",
+      "crush",
+      "cursor",
+      "cursor-agent",
+      "forgecode",
+      "gemini",
+      "goose",
+      "grok",
+      "kimi",
+      "kiro",
+      "llm",
+      "ompi",
+      "opencode",
+      "openhands",
+      "openinterpreter",
+      "pearai",
+      "pi",
+      "qwen",
+      "trae",
+      "vibe",
+      "zed",
+    ]);
+  });
+
+  it("knows which providers support conversation breakdown", () => {
+    expect(supportsConversationBreakdown("claude")).toBe(true);
+    expect(supportsConversationBreakdown("antigravity")).toBe(true);
+    expect(supportsConversationBreakdown("forgecode")).toBe(true);
+    expect(supportsConversationBreakdown("codex")).toBe(false);
+    expect(supportsConversationBreakdown("kimi")).toBe(false);
+    expect(supportsConversationBreakdown("opencode")).toBe(false);
+    expect(supportsConversationBreakdown("unknown")).toBe(false);
+  });
+
+  it("reports provider capabilities for ForgeCode parity actions", () => {
+    expect(supportsNativeRename("forgecode")).toBe(true);
+    expect(supportsSessionDeletion("forgecode")).toBe(true);
+    expect(getResumeCommand("forgecode", "conversation-123")).toBe(
+      "forge conversation resume conversation-123"
+    );
+  });
+
+  it("returns the codex resume subcommand for codex sessions", () => {
+    expect(supportsNativeRename("codex")).toBe(true);
+    expect(supportsSessionDeletion("codex")).toBe(true);
+    expect(getResumeCommand("codex", "abc-123")).toBe("codex resume abc-123");
+  });
+
+  it("returns the kimi resume subcommand for kimi sessions", () => {
+    expect(getProviderLabel((key, fallback) => `${key}:${fallback}`, "kimi")).toBe(
+      "common.provider.kimi:Kimi CLI"
+    );
+    expect(getResumeCommand("kimi", "abc-123")).toBe("kimi -r abc-123");
+  });
+
+  it("returns the vibe resume flag for vibe sessions", () => {
+    expect(getProviderLabel((key, fallback) => `${key}:${fallback}`, "vibe")).toBe(
+      "common.provider.vibe:Mistral Vibe"
+    );
+    expect(getResumeCommand("vibe", "abc-123")).toBe("vibe --resume abc-123");
+  });
+
+  it("returns the Copilot CLI resume flag for copilot sessions with cli entrypoint", () => {
+    expect(
+      getResumeCommand("copilot", "abc-123", undefined, "copilot-cli")
+    ).toBe("copilot --resume=abc-123");
+  });
+
+  it("returns null for copilot sessions that aren't from the CLI surface", () => {
+    expect(
+      getResumeCommand("copilot", "abc-123", undefined, "copilot-desktop")
+    ).toBeNull();
+    expect(
+      getResumeCommand("copilot", "abc-123", undefined, "copilot-vscode")
+    ).toBeNull();
+    // Missing entrypoint also fails closed.
+    expect(getResumeCommand("copilot", "abc-123")).toBeNull();
+  });
+
+  it("getResumeCommand fails closed for unknown provider strings", () => {
+    expect(getResumeCommand("not-a-real-provider", "abc")).toBeNull();
+    expect(getResumeCommand(undefined, "abc")).toBeNull();
+    expect(getResumeCommand("claude", "")).toBeNull();
+    // Aider has no resume CLI command — must stay null even after future additions.
+    expect(getResumeCommand("aider", "abc")).toBeNull();
+  });
+
+  it("prefixes the resume command with `cd` when cwd is provided", () => {
+    expect(getResumeCommand("claude", "abc", "/Users/foo/proj")).toBe(
+      "cd '/Users/foo/proj' && claude --resume abc"
+    );
+    expect(getResumeCommand("codex", "abc", "/Users/foo/proj")).toBe(
+      "cd '/Users/foo/proj' && codex resume abc"
+    );
+    expect(
+      getResumeCommand("copilot", "abc", "/Users/foo/proj", "copilot-cli")
+    ).toBe("cd '/Users/foo/proj' && copilot --resume=abc");
+    expect(getResumeCommand("forgecode", "abc", "/Users/foo/proj")).toBe(
+      "cd '/Users/foo/proj' && forge conversation resume abc"
+    );
+    expect(getResumeCommand("kimi", "abc", "/Users/foo/proj")).toBe(
+      "cd '/Users/foo/proj' && kimi -r abc"
+    );
+  });
+
+  it("getResumeCommand rejects session ids with shell-meaningful chars", () => {
+    // Defense-in-depth: even though CLIs only emit UUID-like IDs, a crafted
+    // JSONL must not be able to extend the clipboard command.
+    expect(getResumeCommand("claude", "abc; rm -rf /")).toBeNull();
+    expect(getResumeCommand("codex", "abc && evil")).toBeNull();
+    expect(getResumeCommand("claude", "abc def")).toBeNull();
+    expect(getResumeCommand("claude", "$(whoami)")).toBeNull();
+    // Allowed charset: alnum, underscore, hyphen.
+    expect(getResumeCommand("claude", "abc-123_XYZ")).toBe(
+      "claude --resume abc-123_XYZ"
+    );
+  });
+
+  it("omits the cd prefix when cwd is empty or missing", () => {
+    expect(getResumeCommand("claude", "abc", undefined)).toBe(
+      "claude --resume abc"
+    );
+    expect(getResumeCommand("claude", "abc", "")).toBe("claude --resume abc");
+  });
+
+  it("single-quotes paths with spaces and escapes embedded apostrophes", () => {
+    expect(getResumeCommand("claude", "abc", "/Users/me/My Stuff")).toBe(
+      "cd '/Users/me/My Stuff' && claude --resume abc"
+    );
+    // POSIX trick: close quote, escaped literal apostrophe, reopen quote.
+    expect(getResumeCommand("codex", "abc", "/tmp/it's-mine")).toBe(
+      "cd '/tmp/it'\\''s-mine' && codex resume abc"
+    );
+  });
+
+  it("formats a Windows resume command that works from CMD and PowerShell", () => {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    );
+
+    const cwd = String.raw`E:\work\My Project`;
+    expect(getResumeCommand("claude", "abc-123", cwd)).toBe(
+      String.raw`powershell.exe -NoProfile -Command "Set-Location -LiteralPath 'E:\work\My Project'; claude --resume abc-123"`,
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("detects whether current scope has any supported provider", () => {
+    expect(hasAnyConversationBreakdownProvider(["claude"])).toBe(true);
+    expect(hasAnyConversationBreakdownProvider(["antigravity"])).toBe(true);
+    expect(hasAnyConversationBreakdownProvider(["forgecode"])).toBe(true);
+    expect(hasAnyConversationBreakdownProvider(["codex", "opencode"])).toBe(
+      false
+    );
+    expect(hasAnyConversationBreakdownProvider(["kimi"])).toBe(false);
+    expect(hasAnyConversationBreakdownProvider([])).toBe(false);
+    expect(hasAnyConversationBreakdownProvider(undefined)).toBe(false);
+  });
+
+  it("calculates conversation breakdown coverage by provider tokens", () => {
+    const coverage = calculateConversationBreakdownCoverage([
+      { provider_id: "claude", tokens: 70 },
+      { provider_id: "antigravity", tokens: 20 },
+      { provider_id: "codex", tokens: 10 },
+    ]);
+
+    expect(coverage.totalTokens).toBe(100);
+    expect(coverage.coveredTokens).toBe(90);
+    expect(coverage.coveragePercent).toBe(90);
+    expect(coverage.hasLimitedProviders).toBe(true);
+  });
+
+  it("returns 0% coverage when there are no tokens", () => {
+    const coverage = calculateConversationBreakdownCoverage([
+      { provider_id: "claude", tokens: 0 },
+      { provider_id: "codex", tokens: 0 },
+    ]);
+
+    expect(coverage.totalTokens).toBe(0);
+    expect(coverage.coveredTokens).toBe(0);
+    expect(coverage.coveragePercent).toBe(0);
+    expect(coverage.hasLimitedProviders).toBe(false);
+  });
+});

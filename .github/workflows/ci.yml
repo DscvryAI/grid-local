@@ -1,0 +1,93 @@
+name: CI
+
+# Windows + macOS gates only -- Grid Local is a Windows/macOS desktop
+# app, and neither job here runs a full `tauri build` (a native
+# installer build is a separate, heavier concern than "does the code
+# compile/lint/test cleanly"); the frontend job runs `vite build`
+# (`pnpm build`'s own `tsc && vite build`) as the frontend build gate.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm i18n:validate
+      - run: pnpm exec vitest run
+      - run: pnpm build
+      - name: Bundle size report (informational)
+        run: node scripts/check-bundle-budget.mjs
+
+  backend:
+    name: Backend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      # Informational only, NOT a blocking gate -- the codebase has
+      # substantial existing `rustfmt` drift across many files.
+      # Reformatting the whole tree is a large, broad-blast-radius diff
+      # that needs its own explicit go-ahead, not something to do
+      # silently as a side effect of adding CI. Flip `continue-on-error`
+      # to `false` once that cleanup lands.
+      - name: cargo fmt --check (informational)
+        working-directory: src-tauri
+        run: cargo fmt --check
+        continue-on-error: true
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --lib -- --test-threads=1
+
+  license-bundle:
+    name: License bundle check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A real, minimal check: THIRD_PARTY_NOTICES.md is embedded into
+      # the built binary at compile time via `include_str!`
+      # (`commands::feedback::get_third_party_notices`) and surfaced in
+      # Settings > About > Licenses (`LicensesModal.tsx`) -- this catches
+      # the file being accidentally deleted, renamed, or emptied before
+      # that ever reaches a real build. The Rust-side compile itself
+      # (in the `backend` job) already catches a missing/unreadable file
+      # (`include_str!` is a compile error); this adds the content checks
+      # `include_str!` alone can't: the required legal text actually
+      # being present, not just the file existing.
+      - name: Verify THIRD_PARTY_NOTICES.md carries its required legal text
+        run: |
+          test -s THIRD_PARTY_NOTICES.md
+          grep -q "MIT License" THIRD_PARTY_NOTICES.md
+          grep -q "claude-code-history-viewer" THIRD_PARTY_NOTICES.md
+      - name: Verify LICENSE is Apache-2.0
+        run: grep -q "Apache License" LICENSE

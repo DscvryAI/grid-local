@@ -1,0 +1,323 @@
+import React from "react";
+import { act, renderHook } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
+import { useSessionEditing } from "@/components/SessionItem/hooks/useSessionEditing";
+import { api } from "@/services/api";
+import { useAppStore } from "@/store/useAppStore";
+import type { ClaudeProject, ClaudeSession } from "@/types";
+
+vi.mock("react-i18next", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("react-i18next")>();
+  return {
+    ...actual,
+    useTranslation: () => ({
+      t: (_key: string, fallback?: string) => fallback ?? "",
+    }),
+  };
+});
+
+vi.mock("sonner", () => ({
+  toast: {
+    success: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
+vi.mock("@/services/api", () => ({
+  api: vi.fn(),
+}));
+
+vi.mock("@/hooks/useSessionMetadata", () => ({
+  useSessionDisplayName: () => "Session title",
+  useSessionMetadata: () => ({
+    customName: undefined,
+    setCustomName: vi.fn().mockResolvedValue(undefined),
+    hasClaudeCodeName: false,
+    setHasClaudeCodeName: vi.fn().mockResolvedValue(undefined),
+  }),
+}));
+
+const session: ClaudeSession & { provider: string; is_renamed: boolean } = {
+  session_id: "session-id",
+  actual_session_id: "actual-session-id",
+  file_path: "/tmp/session.jsonl",
+  project_name: "project",
+  message_count: 10,
+  first_message_time: "2026-04-08T00:00:00Z",
+  last_message_time: "2026-04-08T01:00:00Z",
+  last_modified: "2026-04-08T01:00:00Z",
+  has_tool_use: true,
+  has_errors: false,
+  summary: "Summary",
+  provider: "claude",
+  is_renamed: false,
+};
+
+describe("useSessionEditing clipboard actions", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(api).mockReset();
+    useAppStore.setState({
+      projects: [],
+      selectedProject: null,
+      selectedSession: null,
+      sessions: [],
+      isServerReadOnly: false,
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn(),
+    });
+  });
+
+  it("falls back when browser clipboard write fails for copy session id", async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error("permission denied"));
+    const setData = vi.fn();
+    const addEventListener = vi.spyOn(document, "addEventListener");
+    const removeEventListener = vi.spyOn(document, "removeEventListener");
+    const execCommand = vi.fn().mockImplementation((command: string) => {
+      expect(command).toBe("copy");
+      const copyHandler = addEventListener.mock.calls.find(
+        ([eventName]) => eventName === "copy"
+      )?.[1] as EventListener | undefined;
+      expect(copyHandler).toBeDefined();
+      copyHandler?.({
+        preventDefault: vi.fn(),
+        clipboardData: { setData },
+      } as unknown as ClipboardEvent);
+      return true;
+    });
+
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommand,
+    });
+
+    const stopPropagation = vi.fn();
+    const { result } = renderHook(() => useSessionEditing(session));
+
+    await act(async () => {
+      await result.current.handleCopySessionId({
+        stopPropagation,
+      } as unknown as React.MouseEvent);
+    });
+
+    expect(stopPropagation).toHaveBeenCalled();
+    expect(writeText).toHaveBeenCalledWith("actual-session-id");
+    expect(execCommand).toHaveBeenCalledWith("copy");
+    expect(setData).toHaveBeenCalledWith("text/plain", "actual-session-id");
+    expect(removeEventListener).toHaveBeenCalledWith(
+      "copy",
+      expect.any(Function)
+    );
+    expect(toast.success).toHaveBeenCalledWith("Session ID copied");
+  });
+
+  it("copies ForgeCode resume command for forge sessions", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    const { result } = renderHook(() =>
+      useSessionEditing({
+        ...session,
+        provider: "forgecode",
+        file_path: "forgecode://workspace/ws-1/conversation/conv-1",
+        actual_session_id: "conv-1",
+      })
+    );
+
+    await act(async () => {
+      await result.current.handleCopyResumeCommand({
+        stopPropagation: vi.fn(),
+      } as unknown as React.MouseEvent);
+    });
+
+    // No matching project in the store, so the cd prefix is omitted and the
+    // toast falls back to the no-cwd variant.
+    expect(writeText).toHaveBeenCalledWith("forge conversation resume conv-1");
+    expect(toast.success).toHaveBeenCalledWith(
+      "Resume command copied (working directory unknown)"
+    );
+  });
+
+  it("prefixes the codex resume command with cd when project cwd is known", async () => {
+    const project: ClaudeProject = {
+      name: session.project_name,
+      path: "~/.codex/sessions/-Users-jack-my-proj",
+      actual_path: "/Users/jack/my-proj",
+      session_count: 1,
+      message_count: 1,
+      last_modified: session.last_modified,
+      provider: "codex",
+    };
+    useAppStore.setState({ projects: [project] });
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    const { result } = renderHook(() =>
+      useSessionEditing({
+        ...session,
+        provider: "codex",
+        actual_session_id: "abc-123",
+      })
+    );
+
+    await act(async () => {
+      await result.current.handleCopyResumeCommand({
+        stopPropagation: vi.fn(),
+      } as unknown as React.MouseEvent);
+    });
+
+    expect(writeText).toHaveBeenCalledWith(
+      "cd '/Users/jack/my-proj' && codex resume abc-123"
+    );
+    expect(toast.success).toHaveBeenCalledWith("Resume command copied");
+
+    useAppStore.setState({ projects: [] });
+  });
+
+  it("uses the selected project cwd for a loaded session before same-name projects", async () => {
+    const selectedProject: ClaudeProject = {
+      name: "cym",
+      path: "/root/.claude/projects/-home-cym",
+      actual_path: "/home/cym",
+      session_count: 1,
+      message_count: 1,
+      last_modified: session.last_modified,
+      provider: "claude",
+    };
+    const sameNameClaudeProject: ClaudeProject = {
+      name: "cym",
+      path: "/root/.claude/projects/-home-cym-alt",
+      actual_path: "/wrong/claude/cym",
+      session_count: 1,
+      message_count: 1,
+      last_modified: session.last_modified,
+      provider: "claude",
+    };
+    const loadedSession: ClaudeSession = {
+      ...session,
+      project_name: "cym",
+      file_path: "/root/.claude/projects/-home-cym/session.jsonl",
+    };
+    useAppStore.setState({
+      projects: [sameNameClaudeProject, selectedProject],
+      selectedProject,
+      sessions: [loadedSession],
+    });
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    const { result } = renderHook(() => useSessionEditing(loadedSession));
+
+    await act(async () => {
+      await result.current.handleCopyResumeCommand({
+        stopPropagation: vi.fn(),
+      } as unknown as React.MouseEvent);
+    });
+
+    expect(writeText).toHaveBeenCalledWith(
+      "cd '/home/cym' && claude --resume actual-session-id"
+    );
+  });
+
+  it("does not offer resume when the last-known project location is unavailable", async () => {
+    useAppStore.setState({
+      projects: [
+        {
+          name: session.project_name,
+          path: "/root/.claude/projects/-tmp-deleted-worktree",
+          actual_path: "/tmp/deleted-worktree",
+          session_count: 1,
+          message_count: 1,
+          last_modified: session.last_modified,
+          path_status: "unavailable",
+          provider: "claude",
+        },
+      ],
+    });
+
+    const { result } = renderHook(() => useSessionEditing(session));
+
+    expect(result.current.supportsResumeCommand).toBe(false);
+
+    await act(async () => {
+      await result.current.handleCopyResumeCommand({
+        stopPropagation: vi.fn(),
+      } as unknown as React.MouseEvent);
+    });
+
+    expect(navigator.clipboard.writeText).not.toHaveBeenCalled();
+    expect(toast.error).toHaveBeenCalledWith(
+      "Resume is unavailable because the last-known working directory is missing"
+    );
+  });
+
+  it("reports copy failure when fallback cannot write clipboard payload", async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error("permission denied"));
+    const addEventListener = vi.spyOn(document, "addEventListener");
+    const execCommand = vi.fn().mockImplementation((command: string) => {
+      expect(command).toBe("copy");
+      const copyHandler = addEventListener.mock.calls.find(
+        ([eventName]) => eventName === "copy"
+      )?.[1] as EventListener | undefined;
+      expect(copyHandler).toBeDefined();
+      copyHandler?.({
+        preventDefault: vi.fn(),
+        clipboardData: null,
+      } as unknown as ClipboardEvent);
+      return true;
+    });
+
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommand,
+    });
+
+    const { result } = renderHook(() => useSessionEditing(session));
+
+    await act(async () => {
+      await result.current.handleCopySessionId({
+        stopPropagation: vi.fn(),
+      } as unknown as React.MouseEvent);
+    });
+
+    expect(execCommand).toHaveBeenCalledWith("copy");
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(toast.error).toHaveBeenCalledWith("Copy failed");
+  });
+
+  it("exposes isServerReadOnly from the store", () => {
+    useAppStore.setState({ isServerReadOnly: true });
+
+    const { result } = renderHook(() => useSessionEditing(session));
+
+    expect(result.current.isServerReadOnly).toBe(true);
+  });
+});

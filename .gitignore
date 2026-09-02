@@ -1,0 +1,77 @@
+# Reference-only clone of the upstream fork source — never commit this
+claude-code-history-viewer/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Dependencies
+node_modules
+.pnp
+.pnp.js
+package-lock.json
+
+# Build outputs
+dist
+dist-ssr
+*.local
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+src-tauri/.env
+src-tauri/tauri.local.conf.json
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Build artifacts
+*.tsbuildinfo
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Test coverage
+coverage
+*.lcov
+.nyc_output
+
+# Temporary files
+*.tmp
+*.temp
+.cache
+
+scratch/
+
+# Local internal review notes, not for public consumption
+/adversial_review/
+
+# Claude Code session-continuity working files (local dev convenience,
+# not part of the public project)
+/.claude/
+
+# Scratch output
+/output.txt
+/output/
+
+# insta pending-review snapshot artifacts from local test runs
+*.snap.new
+
+# msys/git-bash crash dumps
+*.stackdump

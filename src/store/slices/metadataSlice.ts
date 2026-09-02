@@ -1,0 +1,329 @@
+/**
+ * Metadata Slice
+ *
+ * Manages user metadata stored in ~/.claude-history-viewer/user-data.json
+ */
+
+import { api } from "@/services/api";
+import type { StateCreator } from "zustand";
+import type {
+  UserMetadata,
+  SessionMetadata,
+  ProjectMetadata,
+  UserSettings,
+  CustomClaudePath,
+  WslSettings,
+} from "../../types";
+import { DEFAULT_USER_METADATA } from "../../types";
+import { matchGlobPattern } from "../../utils/globUtils";
+import type { FullAppStore } from "./types";
+
+// ============================================================================
+// State Interface
+// ============================================================================
+
+export interface MetadataSliceState {
+  /** User metadata from ~/.claude-history-viewer/user-data.json */
+  userMetadata: UserMetadata;
+  /** Whether metadata has been loaded */
+  isMetadataLoaded: boolean;
+  /** Whether metadata is currently loading */
+  isMetadataLoading: boolean;
+  /** Error message if metadata loading failed */
+  metadataError: string | null;
+}
+
+// ============================================================================
+// Actions Interface
+// ============================================================================
+
+export interface MetadataSliceActions {
+  /** Load user metadata from disk */
+  loadMetadata: () => Promise<void>;
+  /** Save entire metadata to disk */
+  saveMetadata: () => Promise<void>;
+  /** Update metadata for a specific session */
+  updateSessionMetadata: (
+    sessionId: string,
+    update: Partial<SessionMetadata>
+  ) => Promise<void>;
+  /** Update metadata for a specific project */
+  updateProjectMetadata: (
+    projectPath: string,
+    update: Partial<ProjectMetadata>
+  ) => Promise<void>;
+  /** Update global user settings */
+  updateUserSettings: (update: Partial<UserSettings>) => Promise<void>;
+  /** Get session display name (custom name or fallback) */
+  getSessionDisplayName: (
+    sessionId: string,
+    fallbackSummary?: string
+  ) => string | undefined;
+  /** Check if a project should be hidden */
+  isProjectHidden: (projectPath: string) => boolean;
+  /** Hide a specific project */
+  hideProject: (projectPath: string) => Promise<void>;
+  /** Unhide a specific project */
+  unhideProject: (projectPath: string) => Promise<void>;
+  /** Add a hidden pattern (glob) */
+  addHiddenPattern: (pattern: string) => Promise<void>;
+  /** Remove a hidden pattern */
+  removeHiddenPattern: (pattern: string) => Promise<void>;
+  /** Add a custom Claude directory path */
+  addCustomClaudePath: (path: string, label?: string) => Promise<void>;
+  /** Remove a custom Claude directory path */
+  removeCustomClaudePath: (path: string) => Promise<void>;
+  /** Update label for a custom Claude directory path */
+  updateCustomClaudePathLabel: (path: string, label: string) => Promise<void>;
+  /** Enable or disable WSL scanning */
+  setWslEnabled: (enabled: boolean) => Promise<void>;
+  /** Toggle a WSL distro in/out of the excluded list */
+  toggleWslDistro: (distroName: string) => Promise<void>;
+  /** Clear metadata error */
+  clearMetadataError: () => void;
+}
+
+export type MetadataSlice = MetadataSliceState & MetadataSliceActions;
+
+// ============================================================================
+// Initial State
+// ============================================================================
+
+export const initialMetadataState: MetadataSliceState = {
+  userMetadata: DEFAULT_USER_METADATA,
+  isMetadataLoaded: false,
+  isMetadataLoading: false,
+  metadataError: null,
+};
+
+// ============================================================================
+// Slice Creator
+// ============================================================================
+
+export const createMetadataSlice: StateCreator<
+  FullAppStore,
+  [],
+  [],
+  MetadataSlice
+> = (set, get) => ({
+  ...initialMetadataState,
+
+  loadMetadata: async () => {
+    set({ isMetadataLoading: true, metadataError: null });
+
+    try {
+      const metadata = await api<UserMetadata>("load_user_metadata");
+      set({
+        userMetadata: metadata,
+        isMetadataLoaded: true,
+        isMetadataLoading: false,
+      });
+    } catch (error) {
+      console.error("Failed to load user metadata:", error);
+      set({
+        userMetadata: DEFAULT_USER_METADATA,
+        isMetadataLoaded: true,
+        isMetadataLoading: false,
+        metadataError: String(error),
+      });
+    }
+  },
+
+  saveMetadata: async () => {
+    const { userMetadata } = get();
+
+    try {
+      await api("save_user_metadata", { metadata: userMetadata });
+    } catch (error) {
+      console.error("Failed to save user metadata:", error);
+      set({ metadataError: String(error) });
+    }
+  },
+
+  updateSessionMetadata: async (
+    sessionId: string,
+    update: Partial<SessionMetadata>
+  ) => {
+    const { userMetadata } = get();
+    const existingSession = userMetadata.sessions[sessionId] || {};
+    const mergedSession: SessionMetadata = { ...existingSession, ...update };
+
+    try {
+      const updatedMetadata = await api<UserMetadata>(
+        "update_session_metadata",
+        {
+          sessionId,
+          update: mergedSession,
+        }
+      );
+      set({ userMetadata: updatedMetadata });
+    } catch (error) {
+      console.error("Failed to update session metadata:", error);
+      set({ metadataError: String(error) });
+    }
+  },
+
+  updateProjectMetadata: async (
+    projectPath: string,
+    update: Partial<ProjectMetadata>
+  ) => {
+    const { userMetadata } = get();
+    const existingProject = userMetadata.projects[projectPath] || {};
+    const mergedProject: ProjectMetadata = { ...existingProject, ...update };
+
+    try {
+      const updatedMetadata = await api<UserMetadata>(
+        "update_project_metadata",
+        {
+          projectPath,
+          update: mergedProject,
+        }
+      );
+      set({ userMetadata: updatedMetadata });
+    } catch (error) {
+      console.error("Failed to update project metadata:", error);
+      set({ metadataError: String(error) });
+    }
+  },
+
+  updateUserSettings: async (update: Partial<UserSettings>) => {
+    const { userMetadata } = get();
+    const mergedSettings: UserSettings = {
+      ...userMetadata.settings,
+      ...update,
+    };
+
+    try {
+      const updatedMetadata = await api<UserMetadata>("update_user_settings", {
+        settings: mergedSettings,
+      });
+      set({ userMetadata: updatedMetadata });
+    } catch (error) {
+      console.error("Failed to update user settings:", error);
+      const message = String(error);
+      set({ metadataError: message });
+      throw new Error(message);
+    }
+  },
+
+  getSessionDisplayName: (
+    sessionId: string,
+    fallbackSummary?: string
+  ): string | undefined => {
+    const { userMetadata } = get();
+    const sessionMeta = userMetadata.sessions[sessionId];
+    return sessionMeta?.customName || fallbackSummary;
+  },
+
+  isProjectHidden: (projectPath: string): boolean => {
+    const { userMetadata } = get();
+
+    // Check explicit hidden flag
+    const projectMeta = userMetadata.projects[projectPath];
+    if (projectMeta?.hidden) {
+      return true;
+    }
+
+    // Check hidden patterns
+    const patterns = userMetadata.settings.hiddenPatterns || [];
+    for (const pattern of patterns) {
+      if (matchGlobPattern(projectPath, pattern)) {
+        return true;
+      }
+    }
+
+    return false;
+  },
+
+  hideProject: async (projectPath: string) => {
+    await get().updateProjectMetadata(projectPath, { hidden: true });
+  },
+
+  unhideProject: async (projectPath: string) => {
+    await get().updateProjectMetadata(projectPath, { hidden: false });
+  },
+
+  addHiddenPattern: async (pattern: string) => {
+    const { userMetadata } = get();
+    const currentPatterns = userMetadata.settings.hiddenPatterns || [];
+    if (!currentPatterns.includes(pattern)) {
+      await get().updateUserSettings({
+        hiddenPatterns: [...currentPatterns, pattern],
+      });
+    }
+  },
+
+  removeHiddenPattern: async (pattern: string) => {
+    const { userMetadata } = get();
+    const currentPatterns = userMetadata.settings.hiddenPatterns || [];
+    await get().updateUserSettings({
+      hiddenPatterns: currentPatterns.filter((p) => p !== pattern),
+    });
+  },
+
+  addCustomClaudePath: async (path: string, label?: string) => {
+    const { userMetadata } = get();
+    const currentPaths = userMetadata.settings.customClaudePaths ?? [];
+    // Normalize: trim trailing slashes for consistent comparison
+    const normalized = path.replace(/[\\/]+$/, "");
+    // Prevent duplicates
+    if (currentPaths.some((cp) => cp.path.replace(/[\\/]+$/, "") === normalized)) {
+      return;
+    }
+    const entry: CustomClaudePath = { path: normalized, label };
+    await get().updateUserSettings({
+      customClaudePaths: [...currentPaths, entry],
+    });
+  },
+
+  removeCustomClaudePath: async (path: string) => {
+    const { userMetadata } = get();
+    const currentPaths = userMetadata.settings.customClaudePaths ?? [];
+    const normalized = path.replace(/[\\/]+$/, "");
+    await get().updateUserSettings({
+      customClaudePaths: currentPaths.filter(
+        (cp) => cp.path.replace(/[\\/]+$/, "") !== normalized
+      ),
+    });
+  },
+
+  updateCustomClaudePathLabel: async (path: string, label: string) => {
+    const { userMetadata } = get();
+    const currentPaths = userMetadata.settings.customClaudePaths ?? [];
+    const normalized = path.replace(/[\\/]+$/, "");
+    await get().updateUserSettings({
+      customClaudePaths: currentPaths.map((cp) =>
+        cp.path.replace(/[\\/]+$/, "") === normalized
+          ? { ...cp, label: label || undefined }
+          : cp
+      ),
+    });
+  },
+
+  setWslEnabled: async (enabled: boolean) => {
+    const current = get().userMetadata?.settings ?? {};
+    const rawWsl = current.wsl;
+    const wsl: WslSettings = {
+      enabled: rawWsl?.enabled ?? false,
+      excludedDistros: rawWsl?.excludedDistros ?? [],
+    };
+    await get().updateUserSettings({ wsl: { ...wsl, enabled } });
+  },
+
+  toggleWslDistro: async (distroName: string) => {
+    const current = get().userMetadata?.settings ?? {};
+    const rawWsl = current.wsl;
+    const wsl: WslSettings = {
+      enabled: rawWsl?.enabled ?? false,
+      excludedDistros: rawWsl?.excludedDistros ?? [],
+    };
+    const excluded = wsl.excludedDistros.includes(distroName)
+      ? wsl.excludedDistros.filter((d: string) => d !== distroName)
+      : [...wsl.excludedDistros, distroName];
+    await get().updateUserSettings({ wsl: { ...wsl, excludedDistros: excluded } });
+  },
+
+  clearMetadataError: () => {
+    set({ metadataError: null });
+  },
+});

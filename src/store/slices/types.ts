@@ -1,0 +1,393 @@
+/**
+ * Store Slice Types
+ *
+ * Shared types for Zustand store slices.
+ */
+
+import type {
+  ClaudeMessage,
+  ClaudeProject,
+  ClaudeSession,
+  AppError,
+  PaginationState,
+  SessionTokenStats,
+  ProjectStatsSummary,
+  SessionComparison,
+  GlobalStatsSummary,
+  SearchFilters,
+  UserMetadata,
+  SessionMetadata,
+  ProjectMetadata,
+  UserSettings,
+  ProviderId,
+  ProviderInfo,
+  StatsMode,
+  MetricMode,
+  SubagentSession,
+} from "../../types";
+import type { ProjectTokenStatsPagination } from "./messageSlice";
+import type { AnalyticsState, AnalyticsViewType } from "../../types/analytics";
+import type { UpdateSettings } from "../../types/updateSettings";
+
+// ============================================================================
+// Search Types
+// ============================================================================
+
+/** Search match information */
+export interface SearchMatch {
+  messageUuid: string;
+  messageIndex: number; // Index in messages array
+  matchIndex: number; // Which match within the message (0-based)
+  matchCount: number; // Total matches in this message
+}
+
+/** Search filter type */
+export type SearchFilterType = "content" | "toolId";
+
+/** Session search state (KakaoTalk-style navigation) */
+export interface SearchState {
+  query: string;
+  matches: SearchMatch[];
+  currentMatchIndex: number;
+  isSearching: boolean;
+  filterType: SearchFilterType;
+  /** @deprecated Use matches field. Kept for backward compatibility. */
+  results: ClaudeMessage[];
+}
+
+// ============================================================================
+// Slice State Interfaces
+// ============================================================================
+
+/** Zustand store setter type */
+export type StoreSet<T> = (
+  partial: T | Partial<T> | ((state: T) => T | Partial<T>),
+  replace?: boolean
+) => void;
+
+/** Zustand store getter type */
+export type StoreGet<T> = () => T;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/** Create empty search state while preserving filterType */
+export const createEmptySearchState = (
+  filterType: SearchFilterType
+): SearchState => ({
+  query: "",
+  matches: [],
+  currentMatchIndex: -1,
+  isSearching: false,
+  filterType,
+  results: [],
+});
+
+// ============================================================================
+// Full App Store Interface (for slice dependencies)
+// ============================================================================
+
+/**
+ * Full AppStore interface that all slices can depend on.
+ * This prevents circular imports and ensures type compatibility.
+ */
+export interface AppStoreState {
+  // Project state
+  claudePath: string;
+  projects: ClaudeProject[];
+  selectedProject: ClaudeProject | null;
+  sessions: ClaudeSession[];
+  sessionsTotal: number;
+  sessionsOffset: number;
+  hasMoreSessions: boolean;
+  selectedSession: ClaudeSession | null;
+  isLoading: boolean;
+  isLoadingProjects: boolean;
+  isLoadingSessions: boolean;
+  isLoadingMoreSessions: boolean;
+  isRefreshingAllConversations: boolean;
+  error: AppError | null;
+  showProviderDiscoveryOnboarding: boolean;
+  showArchiveSyncPrompt: boolean;
+  firstIndexProgress: import("@/services/archiveSyncApi").FirstIndexProgressEvent | null;
+  archiveIndexError: string | null;
+
+  // Message state
+  messages: ClaudeMessage[];
+  pagination: PaginationState;
+  isLoadingMessages: boolean;
+  isLoadingTokenStats: boolean;
+  sessionTokenStats: SessionTokenStats | null;
+  sessionConversationTokenStats: SessionTokenStats | null;
+  projectTokenStats: SessionTokenStats[];
+  projectConversationTokenStats: SessionTokenStats[];
+  projectTokenStatsSummary: ProjectStatsSummary | null;
+  projectConversationTokenStatsSummary: ProjectStatsSummary | null;
+  projectTokenStatsPagination: ProjectTokenStatsPagination;
+  subagentSessions: SubagentSession[];
+  parentSessionStack: ClaudeSession[];
+  toolUseToSubagentMap: Map<string, string>;
+
+  // Search state
+  searchQuery: string;
+  searchResults: ClaudeMessage[];
+  searchFilters: SearchFilters;
+  sessionSearch: SearchState;
+
+  // Analytics state
+  analytics: AnalyticsState;
+
+  // Settings state
+  excludeSidechain: boolean;
+  showSystemMessages: boolean;
+  fontScale: number;
+  highContrast: boolean;
+  updateSettings: UpdateSettings;
+  sessionSortOrder: import("../../types/metadata.types").SessionSortOrder;
+  sessionEntrypointFilter: import("../../types/metadata.types").SessionEntrypointFilter;
+
+  // Global stats state
+  globalSummary: GlobalStatsSummary | null;
+  globalConversationSummary: GlobalStatsSummary | null;
+  isLoadingGlobalStats: boolean;
+
+  // Metadata state
+  userMetadata: UserMetadata;
+  isMetadataLoaded: boolean;
+  isMetadataLoading: boolean;
+  metadataError: string | null;
+
+  // Capture mode state
+  isCaptureMode: boolean;
+  hiddenMessageIds: string[];
+  selectedMessageIds: string[];
+  selectionAnchor: string | null;
+  isCapturing: boolean;
+
+  // Filter state
+  dateFilter: import("../../types").DateFilter;
+  userOnlyFilter: boolean;
+  showParallelTasksInNavigator: boolean;
+  messageFilter: import('./filterSlice').MessageFilter;
+
+  // Navigation state
+  targetMessageUuid: string | null;
+  shouldHighlightTarget: boolean;
+  primarySurface: import('./navigationSlice').PrimarySurface;
+  sessionTab: import('./navigationSlice').SessionTab;
+  insightsTab: import('./navigationSlice').InsightsTab;
+
+  // Watcher state
+  watcherEnabled: boolean;
+  lastUpdateTime: Record<string, number>;
+  activeSessionNearBottom: boolean;
+
+  // Navigator state
+  isNavigatorOpen: boolean;
+
+  // Provider state
+  providers: ProviderInfo[];
+  activeProviders: ProviderId[];
+  isDetectingProviders: boolean;
+
+  // Session picker state (used by CLI `--session-title` hint with multi-match)
+  sessionPickerCandidates: import('./sessionPickerSlice').SessionPickerCandidate[] | null;
+  sessionPickerHintValue: string | null;
+
+  // WebUI server state
+  isServerReadOnly: boolean;
+  isServerConfigLoaded: boolean;
+
+  // Session selection (multi-select mode) state
+  isSessionSelectionMode: boolean;
+  sessionSelectionIds: string[];
+  sessionSelectionAnchor: string | null;
+}
+
+export interface AppStoreActions {
+  // Navigation actions
+  navigateToMessage: (uuid: string) => void;
+  clearTargetMessage: () => void;
+  setPrimarySurface: (surface: import('./navigationSlice').PrimarySurface) => void;
+  setSessionTab: (tab: import('./navigationSlice').SessionTab) => void;
+  setInsightsTab: (tab: import('./navigationSlice').InsightsTab) => void;
+
+  // Project actions
+  initializeApp: () => Promise<void>;
+  runInitializeApp: () => Promise<void>;
+  runStartupScan: () => Promise<void>;
+  completeProviderDiscoveryOnboarding: () => Promise<void>;
+  completeArchiveSyncPrompt: (mode: "auto" | "manual") => Promise<void>;
+  syncArchiveIndex: () => Promise<import("@/services/archiveSyncApi").BackfillSummary | null>;
+  runFirstIndex: () => Promise<import("@/services/archiveSyncApi").BackfillSummary | null>;
+  cancelFirstIndex: () => void;
+  ensureFirstIndexIfNeeded: () => Promise<void>;
+  retryArchiveIndex: () => Promise<void>;
+  discoverProviders: () => Promise<void>;
+  scanProjects: () => Promise<void>;
+  refreshAllConversations: () => Promise<void>;
+  selectProject: (project: ClaudeProject) => Promise<void>;
+  loadMoreSessions: () => Promise<void>;
+  clearProjectSelection: () => void;
+  setClaudePath: (path: string) => Promise<void>;
+  setError: (error: AppError | null) => void;
+  setSelectedSession: (session: ClaudeSession | null) => void;
+  setSessions: (sessions: ClaudeSession[]) => void;
+
+  // Message actions
+  selectSession: (session: ClaudeSession) => Promise<void>;
+  loadMoreMessages: () => Promise<void>;
+  ensureMessageLoaded: (uuid: string) => Promise<boolean>;
+  fetchFullSessionMessages: () => Promise<ClaudeMessage[]>;
+  refreshCurrentSession: () => Promise<void>;
+  loadSessionTokenStats: (sessionPath: string) => Promise<void>;
+  loadProjectTokenStats: (projectPath: string) => Promise<void>;
+  loadMoreProjectTokenStats: (projectPath: string) => Promise<void>;
+  loadProjectStatsSummary: (projectPath: string) => Promise<ProjectStatsSummary>;
+  loadSessionComparison: (
+    sessionId: string,
+    projectPath: string
+  ) => Promise<SessionComparison>;
+  clearTokenStats: () => void;
+  loadSubagents: (sessionPath: string, sourceMessages: ClaudeMessage[]) => Promise<void>;
+  navigateToSubagent: (subagent: SubagentSession) => Promise<void>;
+  navigateBackToParent: () => Promise<void>;
+
+  // Search actions
+  searchMessages: (query: string, filters?: SearchFilters) => Promise<void>;
+  setSearchFilters: (filters: SearchFilters) => void;
+  setSessionSearchQuery: (query: string) => Promise<void> | void;
+  setSearchFilterType: (filterType: SearchFilterType) => void;
+  goToNextMatch: () => void;
+  goToPrevMatch: () => void;
+  goToMatchIndex: (index: number) => void;
+  clearSessionSearch: () => void;
+
+  // Analytics actions
+  setAnalyticsCurrentView: (view: AnalyticsViewType) => void;
+  setAnalyticsStatsMode: (mode: StatsMode) => void;
+  setAnalyticsMetricMode: (mode: MetricMode) => void;
+  setAnalyticsProjectSummary: (summary: ProjectStatsSummary | null) => void;
+  setAnalyticsProjectConversationSummary: (summary: ProjectStatsSummary | null) => void;
+  setAnalyticsSessionComparison: (comparison: SessionComparison | null) => void;
+  setAnalyticsLoadingProjectSummary: (loading: boolean) => void;
+  setAnalyticsLoadingSessionComparison: (loading: boolean) => void;
+  setAnalyticsProjectSummaryError: (error: string | null) => void;
+  setAnalyticsSessionComparisonError: (error: string | null) => void;
+  resetAnalytics: () => void;
+  clearAnalyticsErrors: () => void;
+
+  // Settings actions
+  setExcludeSidechain: (exclude: boolean) => void;
+  setShowSystemMessages: (show: boolean) => void;
+  setFontScale: (scale: number) => Promise<void>;
+  setHighContrast: (enabled: boolean) => Promise<void>;
+  loadUpdateSettings: () => Promise<void>;
+  setUpdateSetting: <K extends keyof UpdateSettings>(
+    key: K,
+    value: UpdateSettings[K]
+  ) => Promise<void>;
+  skipVersion: (version: string) => Promise<void>;
+  postponeUpdate: () => Promise<void>;
+  setSessionSortOrder: (order: import("../../types/metadata.types").SessionSortOrder) => Promise<void>;
+  setSessionEntrypointFilter: (
+    filter: import("../../types/metadata.types").SessionEntrypointFilter
+  ) => Promise<void>;
+
+  // Global stats actions
+  loadGlobalStats: () => Promise<void>;
+  clearGlobalStats: () => void;
+
+  // Metadata actions
+  loadMetadata: () => Promise<void>;
+  saveMetadata: () => Promise<void>;
+  updateSessionMetadata: (
+    sessionId: string,
+    update: Partial<SessionMetadata>
+  ) => Promise<void>;
+  updateProjectMetadata: (
+    projectPath: string,
+    update: Partial<ProjectMetadata>
+  ) => Promise<void>;
+  updateUserSettings: (update: Partial<UserSettings>) => Promise<void>;
+  getSessionDisplayName: (
+    sessionId: string,
+    fallbackSummary?: string
+  ) => string | undefined;
+  isProjectHidden: (projectPath: string) => boolean;
+  hideProject: (projectPath: string) => Promise<void>;
+  unhideProject: (projectPath: string) => Promise<void>;
+  addCustomClaudePath: (path: string, label?: string) => Promise<void>;
+  addHiddenPattern: (pattern: string) => Promise<void>;
+  removeHiddenPattern: (pattern: string) => Promise<void>;
+  clearMetadataError: () => void;
+
+  // Capture mode actions
+  enterCaptureMode: () => void;
+  exitCaptureMode: () => void;
+  hideMessage: (uuid: string) => void;
+  showMessage: (uuid: string) => void;
+  restoreMessages: (uuids: string[]) => void;
+  restoreAllMessages: () => void;
+  isMessageHidden: (uuid: string) => boolean;
+  getHiddenCount: () => number;
+  handleSelectionClick: (
+    uuid: string,
+    orderedUuids: string[],
+    modifiers: { shift: boolean; cmdOrCtrl: boolean },
+  ) => void;
+  clearSelection: () => void;
+  setIsCapturing: (v: boolean) => void;
+
+  // Filter actions
+  setDateFilter: (filter: import("../../types").DateFilter) => void;
+  setUserOnlyFilter: (enabled: boolean) => void;
+  toggleUserOnlyFilter: () => void;
+  setShowParallelTasksInNavigator: (enabled: boolean) => void;
+  toggleShowParallelTasksInNavigator: () => void;
+  toggleRole: (role: keyof import('./filterSlice').MessageFilterRoles) => void;
+  toggleContentType: (contentType: keyof import('./filterSlice').MessageFilterContentTypes) => void;
+  resetMessageFilter: () => void;
+  isMessageFilterActive: () => boolean;
+
+  // Watcher actions
+  setWatcherEnabled: (enabled: boolean) => void;
+  markProjectUpdated: (projectPath: string) => void;
+  triggerProjectRefresh: (projectPath: string) => Promise<void>;
+  triggerSessionRefresh: (projectPath: string, sessionPath: string) => Promise<void>;
+  setActiveSessionNearBottom: (nearBottom: boolean) => void;
+
+  // Navigator actions
+  toggleNavigator: () => void;
+  setNavigatorOpen: (open: boolean) => void;
+
+  // Provider actions
+  detectProviders: () => Promise<boolean>;
+  toggleProvider: (id: ProviderId) => void;
+  setActiveProviders: (ids: ProviderId[]) => void;
+
+  // Session picker actions
+  openSessionPicker: (
+    candidates: import('./sessionPickerSlice').SessionPickerCandidate[],
+    hintValue: string,
+  ) => void;
+  closeSessionPicker: () => void;
+
+  // WebUI server actions
+  loadServerConfig: () => Promise<void>;
+
+  // Session selection (multi-select mode) actions
+  enterSessionSelectionMode: () => void;
+  exitSessionSelectionMode: () => void;
+  toggleSessionSelectionMode: () => void;
+  handleSessionSelectionClick: (
+    sessionId: string,
+    orderedIds: string[],
+    modifiers: { shift: boolean; cmdOrCtrl: boolean }
+  ) => void;
+  setSessionSelectionIds: (ids: string[]) => void;
+  clearSessionSelection: () => void;
+}
+
+export type FullAppStore = AppStoreState & AppStoreActions;

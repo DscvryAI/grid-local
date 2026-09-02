@@ -1,0 +1,221 @@
+// src/components/ProjectTree/components/ProjectItem.tsx
+import React from "react";
+import { AlertCircle, ChevronDown, ChevronRight, Folder, GitBranch } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { cn } from "@/lib/utils";
+import type { ProjectItemProps } from "../types";
+import { getWorktreeLabel } from "../../../utils/worktreeUtils";
+import {
+  getProviderBadgeStyle,
+  getProviderId,
+  getProviderLabel,
+} from "../../../utils/providers";
+import {
+  getCompactParentPath,
+  getPathLeaf,
+  isAbsolutePath,
+  isProjectPathUnavailable,
+} from "../../../utils/pathUtils";
+
+export const ProjectItem: React.FC<ProjectItemProps> = ({
+  project,
+  isExpanded,
+  isSelected,
+  ariaLevel = 1,
+  onToggle,
+  onClick,
+  onContextMenu,
+  variant = "default",
+  showProviderBadge = true,
+}) => {
+  const { t } = useTranslation();
+
+  const isMain = variant === "main";
+  const isWorktree = variant === "worktree";
+  const isGrouped = isMain || isWorktree;
+  const isExpandable = project.session_count > 0;
+  const isPathUnavailable = isProjectPathUnavailable(project);
+  const actualPath = project.actual_path || project.path || project.name;
+
+  const providerId = getProviderId(project.provider);
+  const baseProviderLabel = getProviderLabel(
+    (key, fallback) => t(key, fallback),
+    providerId
+  );
+  const providerLabel = project.custom_directory_label
+    ? `${baseProviderLabel} (${project.custom_directory_label})`
+    : baseProviderLabel;
+  const shouldShowParentPath = !isGrouped && isAbsolutePath(actualPath);
+  const parentPath = shouldShowParentPath ? getCompactParentPath(actualPath) : "";
+  const shouldPreferPathLeaf =
+    providerId === "claude" ||
+    project.name === project.path ||
+    project.name === actualPath ||
+    isAbsolutePath(project.name) ||
+    project.name.startsWith("-");
+
+  const displayName = isMain
+    ? t("project.main", "main")
+    : isWorktree
+      ? getWorktreeLabel(project.actual_path)
+      : shouldPreferPathLeaf
+        ? getPathLeaf(actualPath) || project.name
+        : project.name;
+
+  return (
+    <button
+      type="button"
+      role="treeitem"
+      data-tree-node="project"
+      data-project-path={project.path}
+      aria-level={ariaLevel}
+      aria-selected={isSelected}
+      aria-expanded={isExpandable ? isExpanded : undefined}
+      tabIndex={-1}
+      onClick={onClick}
+      onKeyDown={(e) => {
+        if (e.key === "ArrowRight" && isExpandable && !isExpanded) {
+          e.preventDefault();
+          onToggle();
+        } else if (e.key === "ArrowLeft" && isExpandable && isExpanded) {
+          e.preventDefault();
+          onToggle();
+        }
+      }}
+      onContextMenu={onContextMenu}
+      className={cn(
+        "w-full flex items-center gap-2",
+        "text-left transition-all duration-200 rounded-md cursor-pointer outline-none",
+        isGrouped ? "px-2 py-1.5" : "px-4 py-2.5",
+        isGrouped ? "focus:ring-2 focus:ring-accent" : "focus:ring-2 focus:ring-accent",
+        isGrouped
+          ? "hover:bg-accent/10"
+          : "hover:bg-accent/8 hover:pl-5 border-l-2 border-transparent",
+        !isGrouped && isExpanded && "bg-accent/10 border-l-accent pl-5",
+        isGrouped && isMain && "hover:bg-accent/10",
+        isGrouped && isWorktree && "hover:bg-emerald-500/10",
+        isGrouped && isExpanded && (isMain ? "bg-accent/15" : "bg-emerald-500/15")
+      )}
+    >
+      {/* Expand Icon */}
+      <span
+        aria-label={isExpanded ? t("common.collapse", "Collapse") : t("common.expand", "Expand")}
+        className={cn(
+          "transition-all duration-200 p-0.5 -m-0.5 rounded",
+          isExpanded
+            ? isWorktree
+              ? "text-emerald-500"
+              : "text-accent"
+            : "text-muted-foreground"
+        )}
+      >
+        {isExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+      </span>
+
+      {/* Icon */}
+      {isGrouped ? (
+        isMain ? (
+          <span title="Project">
+            <Folder
+              className={cn(
+                "w-3.5 h-3.5 transition-colors",
+                isExpanded ? "text-accent" : "text-muted-foreground"
+              )}
+            />
+          </span>
+        ) : (
+          <span title="Worktree">
+            <GitBranch
+              className={cn(
+                "w-3.5 h-3.5 transition-colors",
+                isExpanded ? "text-emerald-500" : "text-emerald-600/60 dark:text-emerald-400/60"
+              )}
+            />
+          </span>
+        )
+      ) : (
+        <div
+          className={cn(
+            "w-6 h-6 rounded-md flex items-center justify-center transition-all duration-300",
+            isExpanded ? "bg-accent/20 text-accent" : "bg-muted/50 text-muted-foreground"
+          )}
+        >
+          <Folder className="w-3.5 h-3.5" />
+        </div>
+      )}
+
+      {/* Project Name */}
+      <span
+        className="min-w-0 flex-1"
+        title={actualPath}
+      >
+        <span
+          className={cn(
+            "block truncate transition-colors",
+            isGrouped ? "text-xs" : "text-sm",
+            isExpanded
+              ? isWorktree
+                ? "text-emerald-600 dark:text-emerald-400 font-medium"
+                : isGrouped
+                  ? "text-accent font-medium"
+                  : "text-accent font-semibold"
+              : isGrouped
+                ? "text-muted-foreground"
+                : "text-sidebar-foreground/80",
+            !isGrouped && "duration-300"
+          )}
+        >
+          {displayName}
+        </span>
+        {parentPath && (
+          <span className="mt-0.5 block truncate text-2xs text-muted-foreground/70">
+            {parentPath}
+          </span>
+        )}
+      </span>
+
+      {/* Provider Badge */}
+      {showProviderBadge && (
+        <span
+          className={cn(
+            "px-1.5 py-0.5 text-2xs font-medium rounded-full flex-shrink-0 leading-none",
+            getProviderBadgeStyle(providerId)
+          )}
+        >
+          {providerLabel}
+        </span>
+      )}
+
+      {isPathUnavailable && (
+        <span
+          data-testid="project-path-unavailable"
+          aria-label={t("project.pathUnavailable", "Location unavailable")}
+          title={t("project.pathUnavailablePath", {
+            path: actualPath,
+            defaultValue: "Last-known location is unavailable: {{path}}",
+          })}
+          className="flex-shrink-0 text-amber-600 dark:text-amber-400"
+        >
+          <AlertCircle className="w-3.5 h-3.5" aria-hidden="true" />
+        </span>
+      )}
+
+      {/* Session Count */}
+      {(!isGrouped && project.session_count > 0) || isGrouped ? (
+        <span
+          className={cn(
+            "text-2xs font-mono rounded",
+            isGrouped
+              ? "text-muted-foreground/60"
+              : cn(
+                "px-1.5 py-0.5",
+                isExpanded ? "text-accent/70 bg-accent/10" : "text-muted-foreground/60"
+              )
+          )}
+        >
+          {project.session_count}
+        </span>
+      ) : null}
+    </button>
+  );
+};

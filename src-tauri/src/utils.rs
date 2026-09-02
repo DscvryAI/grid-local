@@ -1,0 +1,1187 @@
+use crate::models::{ClaudeMessage, GitInfo, GitWorktreeType};
+use chrono::{DateTime, Utc};
+use memchr::memchr_iter;
+use serde_json::Value;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+/// Estimated average bytes per JSONL line (used for capacity pre-allocation)
+/// Based on typical Claude message sizes (800-1200 bytes average)
+const ESTIMATED_BYTES_PER_LINE: usize = 500;
+
+/// Average bytes per message for file size estimation
+const AVERAGE_MESSAGE_SIZE_BYTES: f64 = 1000.0;
+
+/// The one indirection point for "this user's home directory" across the
+/// whole backend.
+///
+/// `dirs::home_dir()` reads the `HOME` env var on Unix but
+/// `USERPROFILE`/`SHGetKnownFolderPath` on Windows -- a test's `env::
+/// set_var("HOME", temp_dir)` therefore silently does nothing on
+/// Windows, leaking this real machine's real home directory (and real
+/// provider data) into tests that believe they're isolated. Every one
+/// of the ~60 production call sites that previously called `dirs::
+/// home_dir()` directly now calls this instead -- a pure drop-in
+/// replacement (identical `Option<PathBuf>` signature, zero behavior
+/// change for real users, since `GRID_LOCAL_HOME_OVERRIDE` is never set
+/// outside test code) that gives every test a SINGLE, cross-platform-
+/// reliable override point. See [`test_support::home_override_guard`]
+/// for the paired test helper.
+pub fn resolve_home_dir() -> Option<PathBuf> {
+    if let Ok(override_path) = std::env::var("GRID_LOCAL_HOME_OVERRIDE") {
+        if !override_path.is_empty() {
+            return Some(PathBuf::from(override_path));
+        }
+    }
+    dirs::home_dir()
+}
+
+/// True for a string that looks like an absolute path on ANY platform Grid
+/// Local runs on -- not just whatever `Path::is_absolute()` says on the
+/// current runtime. Ingested history data (a `cwd` field in a session file,
+/// say) can have been written on a different OS than the one browsing it
+/// today, and `std::path::Path::is_absolute()` is deliberately runtime-OS-
+/// native: on Windows it rejects a plain Unix path like `/Users/...` (no
+/// drive prefix), and on Unix it rejects a Windows drive-letter path.
+pub(crate) fn looks_like_absolute_path(path: &str) -> bool {
+    if path.starts_with('/') {
+        return true;
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        return true;
+    }
+    bytes.len() >= 2 && matches!(bytes[0], b'\\' | b'/') && bytes[0] == bytes[1]
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::archive_db::test_support::EnvVarGuard;
+    use std::path::Path;
+
+    /// Points [`super::resolve_home_dir`] at `path` for the lifetime of the
+    /// returned guard -- the one reliable, cross-platform replacement for
+    /// the previous (Windows-broken) `env::set_var("HOME", ...)` pattern
+    /// scattered across this codebase's own tests. Callers needing an
+    /// isolated *empty* home directory should pair this with a `TempDir`
+    /// they create and hold themselves (same two-value pattern
+    /// `empty_codex_home_guard` already established) rather than this
+    /// helper creating one implicitly, since callers often want to seed
+    /// specific fixture files under the override path first.
+    pub(crate) fn home_override_guard(path: &Path) -> EnvVarGuard {
+        EnvVarGuard::set("GRID_LOCAL_HOME_OVERRIDE", path)
+    }
+
+    /// `std::fs::canonicalize()` on Windows returns an extended-length UNC
+    /// path (`\\?\C:\Users\...`), which real Claude-generated (or any
+    /// other provider's) encoded project slugs never carry -- a fixture
+    /// that canonicalizes a `TempDir` before dash-encoding it therefore
+    /// tests an artifact of that one call, not real production data.
+    /// Found via `utils::tests::make_encoded_path`'s own fix; promoted
+    /// here once a second, independent test needed the identical treatment
+    /// (`providers::codebuddy::tests::scan_projects_falls_back_to_fs_
+    /// decoding_when_cwd_missing`) rather than duplicating the strip
+    /// logic a third time.
+    pub(crate) fn canonicalize_for_fixture(path: &Path) -> std::path::PathBuf {
+        let canonical = path.canonicalize().expect("canonicalize fixture path");
+        let stripped = canonical
+            .to_string_lossy()
+            .strip_prefix(r"\\?\")
+            .map(std::path::PathBuf::from);
+        stripped.unwrap_or(canonical)
+    }
+}
+
+/// Find line boundaries in a memory-mapped buffer using memchr (SIMD-accelerated)
+/// Returns a vector of (start, end) byte positions for each line
+/// Empty lines are skipped
+#[inline]
+pub fn find_line_ranges(data: &[u8]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::with_capacity(data.len() / ESTIMATED_BYTES_PER_LINE);
+    let mut start = 0;
+
+    for pos in memchr_iter(b'\n', data) {
+        if pos > start {
+            ranges.push((start, pos));
+        }
+        start = pos + 1;
+    }
+
+    // Handle last line without trailing newline
+    if start < data.len() {
+        ranges.push((start, data.len()));
+    }
+
+    ranges
+}
+
+/// Find line start positions (for compatibility with existing load.rs patterns)
+/// Returns positions where each line starts
+#[inline]
+pub fn find_line_starts(data: &[u8]) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(data.len() / ESTIMATED_BYTES_PER_LINE + 1);
+    starts.push(0);
+
+    for pos in memchr_iter(b'\n', data) {
+        if pos + 1 < data.len() {
+            starts.push(pos + 1);
+        }
+    }
+
+    starts
+}
+
+pub fn extract_project_name(raw_project_name: &str) -> String {
+    if let Some(stripped) = raw_project_name.strip_prefix('-') {
+        // Prefer filesystem-checked decoding — handles arbitrarily deep paths
+        // and project names containing hyphens (e.g. ~/Projects/{Host}/{Org}/{Repo}).
+        if let Some(decoded) = decode_with_filesystem_check(stripped) {
+            if let Some(leaf) = Path::new(&decoded).file_name() {
+                return leaf.to_string_lossy().to_string();
+            }
+        }
+        // Fallback: original heuristic for paths no longer on disk.
+        let parts: Vec<&str> = raw_project_name.splitn(4, '-').collect();
+        if parts.len() == 4 {
+            return parts[3].to_string();
+        }
+    }
+    raw_project_name.to_string()
+}
+
+/// Estimate message count from file size (more accurate calculation)
+pub fn estimate_message_count_from_size(file_size: u64) -> usize {
+    // Average JSON message is 800-1200 bytes (using AVERAGE_MESSAGE_SIZE_BYTES)
+    // Small files are treated as having at least 1 message
+    ((file_size as f64 / AVERAGE_MESSAGE_SIZE_BYTES).ceil() as usize).max(1)
+}
+
+/// Parse an RFC3339 timestamp into UTC for robust cross-provider sorting.
+pub fn parse_rfc3339_utc(timestamp: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Validates that `id` is a single, safe path component (no traversal).
+///
+/// Returns `true` only if `id` is a single normal component (e.g. `"abc-123"`).
+/// Rejects empty strings, path separators, `..`, `.`, and multi-component paths.
+pub fn is_safe_storage_id(id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+
+    let mut components = Path::new(id).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+/// Validates that a path is a non-empty absolute path.
+pub fn require_absolute_path(path: &str, label: &str) -> Result<(), String> {
+    if path.trim().is_empty() || !Path::new(path).is_absolute() {
+        return Err(format!("{label} must be a non-empty absolute path"));
+    }
+    Ok(())
+}
+
+/// Validates that a custom Claude directory path is safe to use.
+///
+/// Checks: absolute path, not a symlink (base and projects/), projects/ exists and is a dir.
+/// Returns the canonicalized `projects/` path on success.
+pub fn validate_custom_claude_path(base_path: &Path) -> Result<std::path::PathBuf, String> {
+    if !base_path.is_absolute() {
+        return Err(format!(
+            "Custom path must be absolute: {}",
+            base_path.display()
+        ));
+    }
+
+    // Reject symlinked base
+    let base_meta = std::fs::symlink_metadata(base_path)
+        .map_err(|e| format!("Cannot read metadata for {}: {e}", base_path.display()))?;
+    if base_meta.file_type().is_symlink() {
+        return Err(format!(
+            "Custom path must not be a symlink: {}",
+            base_path.display()
+        ));
+    }
+
+    let projects_path = base_path.join("projects");
+
+    // Reject symlinked projects/
+    let projects_meta = std::fs::symlink_metadata(&projects_path)
+        .map_err(|_| format!("No projects/ directory in {}", base_path.display()))?;
+    if projects_meta.file_type().is_symlink() {
+        return Err(format!(
+            "projects/ must not be a symlink in {}",
+            base_path.display()
+        ));
+    }
+    if !projects_meta.is_dir() {
+        return Err(format!(
+            "projects/ is not a directory in {}",
+            base_path.display()
+        ));
+    }
+
+    // Canonicalize and verify containment
+    let canonical_base = std::fs::canonicalize(base_path)
+        .map_err(|e| format!("Failed to canonicalize {}: {e}", base_path.display()))?;
+    let canonical_projects = std::fs::canonicalize(&projects_path)
+        .map_err(|e| format!("Failed to canonicalize projects/: {e}"))?;
+
+    if !canonical_projects.starts_with(&canonical_base) {
+        return Err("projects/ path escapes the base directory".to_string());
+    }
+
+    Ok(canonical_projects)
+}
+
+/// Recursively searches JSON string values for a lowercase query.
+///
+/// `query_lower` must already be lowercased by the caller.
+pub fn search_json_value_case_insensitive(value: &serde_json::Value, query_lower: &str) -> bool {
+    match value {
+        serde_json::Value::String(s) => s.to_lowercase().contains(query_lower),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .any(|item| search_json_value_case_insensitive(item, query_lower)),
+        serde_json::Value::Object(obj) => obj
+            .values()
+            .any(|v| search_json_value_case_insensitive(v, query_lower)),
+        _ => false,
+    }
+}
+
+/// Returns whether the query matches text that the global-search result card
+/// can preview directly, rather than only nested tool input or output.
+///
+/// `query_lower` must already be lowercased by the caller.
+pub fn search_message_text_case_insensitive(message: &ClaudeMessage, query_lower: &str) -> bool {
+    match message.content.as_ref() {
+        Some(Value::String(text)) => text.to_lowercase().contains(query_lower),
+        Some(Value::Array(items)) => items.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("text")
+                && item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.to_lowercase().contains(query_lower))
+        }),
+        _ => false,
+    }
+}
+
+/// Relevance tier for global-search results: user text, assistant text, other
+/// previewable text, then tool-only matches. Timestamps break ties later.
+pub fn search_result_priority(message: &ClaudeMessage, query_lower: &str) -> usize {
+    if !search_message_text_case_insensitive(message, query_lower) {
+        return 3;
+    }
+
+    match message.message_type.as_str() {
+        "user" => 0,
+        "assistant" => 1,
+        _ => 2,
+    }
+}
+
+// ===== Git Worktree Detection =====
+
+/// Decode Claude session storage path to actual project path
+///
+/// Claude stores sessions in ~/.claude/projects/ with the project path encoded:
+/// - `/Users/jack/.claude/projects/-Users-jack-my-project` → `/Users/jack/my-project`
+/// - `/Users/jack/.claude/projects/-tmp-feature-my-project` → `/tmp/feature-my-project`
+///
+/// This function uses filesystem existence checks to correctly decode paths
+/// where the project name itself contains hyphens.
+pub fn decode_project_path(session_storage_path: &str) -> String {
+    // 1. Try reading originalPath from sessions-index.json (most reliable)
+    let index_path = Path::new(session_storage_path).join("sessions-index.json");
+    if let Ok(content) = std::fs::read_to_string(&index_path) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(original) = parsed.get("originalPath").and_then(|v| v.as_str()) {
+                if !original.is_empty() && Path::new(original).is_absolute() {
+                    return original.to_string();
+                }
+            }
+        }
+    }
+
+    // 2. Fallback: decode from encoded directory name.
+    // `MARKER` is a forward-slash literal, but `session_storage_path` is built via
+    // `PathBuf::join()` and uses backslashes on Windows -- `.find(MARKER)`
+    // silently never matched there, so this whole decode path fell
+    // straight through to returning `session_storage_path` unchanged on
+    // every real Windows install. Normalize separators for the search
+    // only (Claude's own encoded directory names never contain a literal
+    // backslash, so this can't misfire on real data).
+    let normalized_for_marker_search = session_storage_path.replace('\\', "/");
+    const MARKER: &str = ".claude/projects/";
+    if let Some(marker_pos) = normalized_for_marker_search.find(MARKER) {
+        let encoded = &normalized_for_marker_search[marker_pos + MARKER.len()..];
+        if let Some(stripped) = encoded.strip_prefix('-') {
+            // Try filesystem-based decoding (recursive)
+            if let Some(path) = decode_with_filesystem_check(stripped) {
+                return path;
+            }
+
+            // Fallback: use heuristic decoding (still uses original encoded with dash)
+            let parts: Vec<&str> = encoded.splitn(4, '-').collect();
+            if parts.len() >= 4 {
+                return format!("/{}/{}/{}", parts[1], parts[2], parts[3]);
+            } else if parts.len() == 3 {
+                return format!("/{}/{}", parts[1], parts[2]);
+            } else if parts.len() == 2 {
+                return format!("/{}", parts[1]);
+            }
+        }
+    }
+    session_storage_path.to_string()
+}
+
+/// Resolve a session storage folder to a real on-disk project path, returning
+/// `None` when the folder name cannot be verified against the filesystem.
+///
+/// Unlike [`decode_project_path`], this never falls back to a lossy heuristic
+/// guess: it only ever returns a path that actually exists on disk. Callers can
+/// therefore treat a successful result as the folder's authoritative identity.
+///
+/// This complements the `cwd`-from-JSONL resolution introduced in #369: that
+/// handles the case where the *folder name* is lossy/unresolvable (so the real
+/// `cwd` is the better signal), while this handles the opposite case where the
+/// embedded `cwd` is stale — e.g. a session manually moved between project
+/// folders keeps its original `cwd`, but its containing folder is authoritative.
+pub fn decode_project_path_verified(session_storage_path: &str) -> Option<String> {
+    // 1. Prefer originalPath from sessions-index.json, but only if it still
+    //    points at an existing directory.
+    let index_path = Path::new(session_storage_path).join("sessions-index.json");
+    if let Ok(content) = std::fs::read_to_string(&index_path) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(original) = parsed.get("originalPath").and_then(|v| v.as_str()) {
+                let original = original.trim();
+                let candidate = Path::new(original);
+                // Use symlink_metadata (not is_dir, which follows symlinks) so a
+                // symlinked directory is rejected here too, matching the
+                // symlink-blocking policy in decode_with_filesystem_check.
+                let is_real_dir = std::fs::symlink_metadata(candidate)
+                    .map(|m| m.file_type().is_dir())
+                    .unwrap_or(false);
+                if candidate.is_absolute() && is_real_dir {
+                    return Some(original.to_string());
+                }
+            }
+        }
+    }
+
+    // 2. Decode the encoded folder name, verifying each segment against the
+    //    filesystem. Returns `None` if the decoded path does not exist.
+    // Same Windows backslash-vs-forward-slash marker fix as
+    // `decode_project_path` above -- see its own comment for why.
+    let normalized_for_marker_search = session_storage_path.replace('\\', "/");
+    const MARKER: &str = ".claude/projects/";
+    let marker_pos = normalized_for_marker_search.find(MARKER)?;
+    let encoded = &normalized_for_marker_search[marker_pos + MARKER.len()..];
+    let stripped = encoded.strip_prefix('-')?;
+    decode_with_filesystem_check(stripped)
+}
+
+/// Decode path by checking filesystem existence at each possible split point
+///
+/// For `-Users-jack-client-claude-code-history-viewer`:
+/// 1. Check `/Users` (exists? continue)
+/// 2. Check `/Users/jack` (exists? continue)
+/// 3. Check `/Users/jack/client` (exists? continue)
+/// 4. Check `/Users/jack/client/claude-code-history-viewer` (exists? ✓ return this)
+pub(crate) fn decode_with_filesystem_check(encoded: &str) -> Option<String> {
+    decode_recursive(encoded, "")
+}
+
+/// `true` for a bare Windows drive letter segment like `"C:"` or `"D:"` --
+/// the one root shape `decode_recursive_inner`'s otherwise-Unix-only
+/// `/{segment}` candidate can never represent correctly.
+fn is_windows_drive_letter(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// Recursively decode hyphen-separated path segments by checking filesystem existence.
+///
+/// For each hyphen in `encoded`, tries treating it as a `/` separator.
+/// When a valid directory is found, recurses on the remaining string.
+/// This handles nested directories like "claude-code-history-viewer-src-tauri"
+/// → "claude-code-history-viewer/src-tauri".
+fn decode_recursive(encoded: &str, base_path: &str) -> Option<String> {
+    decode_recursive_inner(encoded, base_path, 0)
+}
+
+fn decode_recursive_inner(encoded: &str, base_path: &str, depth: usize) -> Option<String> {
+    if depth > 20 {
+        return None;
+    }
+    if encoded.is_empty() {
+        if !base_path.is_empty() && Path::new(base_path).exists() {
+            return Some(base_path.to_string());
+        }
+        return None;
+    }
+
+    let hyphen_positions: Vec<usize> = encoded
+        .char_indices()
+        .filter(|(_, c)| *c == '-')
+        .map(|(i, _)| i)
+        .collect();
+
+    // Try each hyphen as a potential path separator
+    for &pos in &hyphen_positions {
+        let segment = &encoded[..pos];
+        if segment.is_empty() {
+            continue;
+        }
+
+        let candidate = if base_path.is_empty() {
+            if is_windows_drive_letter(segment) {
+                // A bare `/{segment}` root candidate (e.g. "/C:") can never be a
+                // real directory on Windows -- a drive-letter root needs
+                // its own trailing separator ("C:/"), not a leading one.
+                // Without this, `decode_with_filesystem_check` silently
+                // failed for every real Windows path deeper than 3
+                // segments, falling back to a cruder heuristic that
+                // returns the wrong (still-encoded) project name.
+                format!("{segment}/")
+            } else {
+                format!("/{segment}")
+            }
+        } else {
+            format!("{base_path}/{segment}")
+        };
+
+        // Use symlink_metadata to avoid following symlinks
+        let is_real_dir = std::fs::symlink_metadata(&candidate)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
+
+        if is_real_dir {
+            let remaining = &encoded[pos + 1..];
+            if remaining.is_empty() {
+                return Some(candidate);
+            }
+
+            // First try: remaining as a single leaf (no more splitting needed)
+            let full_path = format!("{candidate}/{remaining}");
+            let full_path_is_real = std::fs::symlink_metadata(&full_path)
+                .map(|m| !m.file_type().is_symlink())
+                .unwrap_or(false);
+            if full_path_is_real {
+                return Some(full_path);
+            }
+
+            // Recurse: remaining may itself contain hyphens that are path separators
+            if let result @ Some(_) = decode_recursive_inner(remaining, &candidate, depth + 1) {
+                return result;
+            }
+        }
+    }
+
+    // No hyphen worked as separator — treat entire encoded as a single segment
+    if !base_path.is_empty() {
+        let full_path = format!("{base_path}/{encoded}");
+        if Path::new(&full_path).exists() {
+            return Some(full_path);
+        }
+    }
+
+    None
+}
+
+/// Extract main git directory from gitdir path
+///
+/// `/Users/jack/main/.git/worktrees/feature` → `/Users/jack/main/.git`
+fn extract_main_git_dir(gitdir: &str) -> Option<String> {
+    const WORKTREES_MARKER: &str = "/.git/worktrees/";
+    if let Some(pos) = gitdir.find(WORKTREES_MARKER) {
+        return Some(format!("{}/.git", &gitdir[..pos]));
+    }
+    None
+}
+
+/// Detect git worktree information for a project
+///
+/// Detection method:
+/// 1. If `.git` is a directory → [`Main`] (main repository)
+/// 2. If `.git` is a file → Parse content to get [`Linked`] (linked worktree)
+/// 3. If `.git` doesn't exist → [`NotGit`]
+///
+/// [`Main`]: GitWorktreeType::Main
+/// [`Linked`]: GitWorktreeType::Linked
+/// [`NotGit`]: GitWorktreeType::NotGit
+pub fn detect_git_worktree_info(project_path: &str) -> Option<GitInfo> {
+    let actual_path = decode_project_path(project_path);
+    let git_path = Path::new(&actual_path).join(".git");
+
+    if !git_path.exists() {
+        return Some(GitInfo {
+            worktree_type: GitWorktreeType::NotGit,
+            main_project_path: None,
+        });
+    }
+
+    if git_path.is_dir() {
+        // Main repository
+        return Some(GitInfo {
+            worktree_type: GitWorktreeType::Main,
+            main_project_path: None,
+        });
+    }
+
+    if git_path.is_file() {
+        // Linked worktree - parse .git file content
+        // Content format: "gitdir: /path/to/main/.git/worktrees/branch-name"
+        if let Ok(content) = fs::read_to_string(&git_path) {
+            if let Some(gitdir) = content.strip_prefix("gitdir: ") {
+                let gitdir = gitdir.trim();
+                // /path/to/main/.git/worktrees/branch-name -> /path/to/main/.git
+                if let Some(main_git_dir) = extract_main_git_dir(gitdir) {
+                    // /path/to/main/.git -> /path/to/main
+                    let main_project_path = Path::new(&main_git_dir)
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string());
+
+                    return Some(GitInfo {
+                        worktree_type: GitWorktreeType::Linked,
+                        main_project_path,
+                    });
+                }
+            }
+        }
+    }
+
+    // Fallback: can't determine
+    Some(GitInfo {
+        worktree_type: GitWorktreeType::NotGit,
+        main_project_path: None,
+    })
+}
+
+/// Check if a path is a symlink (without following it)
+pub fn is_symlink(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// Convert milliseconds timestamp to ISO 8601 string
+pub fn ms_to_iso(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(i64::try_from(ms).unwrap_or(0))
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .unwrap_or_default()
+}
+
+/// Max threads a single provider scanner may use for its per-workspace work.
+/// ~27 scanners already run concurrently on the blocking pool (#434), so each
+/// one stays modest instead of grabbing every core.
+const MAX_SCAN_THREADS: usize = 8;
+
+/// Map `f` over `items` in parallel on a small dedicated rayon pool,
+/// preserving input order in the returned `Vec`.
+///
+/// Built for provider scanners that visit one `SQLite` DB (or session dir) per
+/// workspace: each visit can park up to `busy_timeout` on a locked DB, so
+/// running them sequentially makes startup scale with the workspace count
+/// (dozens of workspaces × 5s worst case). A *dedicated* pool — not rayon's
+/// global one — keeps those parked waits from starving other scanners'
+/// `par_iter` work, and is capped at `min(MAX_SCAN_THREADS, cores)`.
+///
+/// Falls back to a plain sequential map when there is at most one item or the
+/// pool cannot be built, so callers never gain a new failure mode.
+pub fn par_map_bounded<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T) -> R + Sync + Send,
+{
+    let threads = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(MAX_SCAN_THREADS);
+
+    if items.len() <= 1 || threads <= 1 {
+        return items.into_iter().map(f).collect();
+    }
+
+    match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+        Ok(pool) => {
+            use rayon::prelude::*;
+            // `into_par_iter` on a Vec is indexed, so `collect` preserves the
+            // input order — callers keep their pre-parallel ordering semantics.
+            pool.install(|| items.into_par_iter().map(f).collect())
+        }
+        Err(_) => items.into_iter().map(f).collect(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Build a `ClaudeMessage` with common defaults for provider implementations.
+///
+/// Providers only differ in `provider` string and optional fields like `tool_use`.
+/// This eliminates the per-provider boilerplate of setting 20+ None fields.
+pub fn build_provider_message(
+    provider: &str,
+    uuid: String,
+    session_id: &str,
+    timestamp: String,
+    message_type: &str,
+    role: Option<&str>,
+    content: Option<Value>,
+    model: Option<String>,
+) -> ClaudeMessage {
+    ClaudeMessage {
+        uuid,
+        parent_uuid: None,
+        session_id: session_id.to_string(),
+        timestamp,
+        message_type: message_type.to_string(),
+        content,
+        project_name: None,
+        tool_use: None,
+        tool_use_result: None,
+        is_sidechain: None,
+        usage: None,
+        role: role.map(String::from),
+        model,
+        stop_reason: None,
+        cost_usd: None,
+        duration_ms: None,
+        message_id: None,
+        snapshot: None,
+        is_snapshot_update: None,
+        data: None,
+        tool_use_id: None,
+        parent_tool_use_id: None,
+        operation: None,
+        subtype: None,
+        level: None,
+        hook_count: None,
+        hook_infos: None,
+        stop_reason_system: None,
+        prevented_continuation: None,
+        compact_metadata: None,
+        microcompact_metadata: None,
+        provider: Some(provider.to_string()),
+    }
+}
+
+/// Finds subagent JSONL files for a given session file.
+///
+/// Checks two candidate directory layouts:
+/// 1. `{parent}/{stem}/subagents/`  — Claude Code native layout
+/// 2. `{parent}/subagents/{stem}/`  — archive layout (backward compat)
+///
+/// Workflow sub-agents live one level deeper — `subagents/workflows/wf_*/
+/// agent-*.jsonl` (issue #449) — and are included too. Only `agent-*.jsonl`
+/// counts there: each run directory also holds a `journal.jsonl` that is
+/// orchestration metadata, not a conversation.
+///
+/// Symlinks are rejected for security.
+pub fn find_subagent_files(session_file_path: &Path) -> Vec<std::path::PathBuf> {
+    let parent = match session_file_path.parent() {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let stem = match session_file_path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    let candidate_dirs = [
+        parent.join(stem).join("subagents"), // native: {uuid}/subagents/
+        parent.join("subagents").join(stem), // archive compat: subagents/{uuid}/
+    ];
+
+    let mut files = Vec::new();
+    for dir in &candidate_dirs {
+        let Ok(dir_meta) = fs::symlink_metadata(dir) else {
+            continue;
+        };
+        if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
+            continue;
+        }
+
+        if let Ok(rd) = fs::read_dir(dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if let Ok(meta) = fs::symlink_metadata(&p) {
+                    if meta.file_type().is_symlink() {
+                        continue;
+                    }
+                    // Workflow runs nest one level deeper; other directories
+                    // intentionally fall through to the extension check so a
+                    // directory masquerading as `*.jsonl` still surfaces and
+                    // fails loudly downstream instead of being skipped.
+                    if meta.is_dir() && p.file_name().and_then(|n| n.to_str()) == Some("workflows")
+                    {
+                        collect_workflow_agent_files(&p, &mut files);
+                        continue;
+                    }
+                }
+                if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                    files.push(p);
+                }
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// Collects `agent-*.jsonl` transcripts from `subagents/workflows/<run>/`
+/// directories. Symlinks are rejected at every level, mirroring
+/// [`find_subagent_files`].
+fn collect_workflow_agent_files(workflows_dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+    let Ok(runs) = fs::read_dir(workflows_dir) else {
+        return;
+    };
+    for run_entry in runs.flatten() {
+        let run_dir = run_entry.path();
+        let Ok(run_meta) = fs::symlink_metadata(&run_dir) else {
+            continue;
+        };
+        if run_meta.file_type().is_symlink() || !run_meta.is_dir() {
+            continue;
+        }
+        let Ok(agents) = fs::read_dir(&run_dir) else {
+            continue;
+        };
+        for agent_entry in agents.flatten() {
+            let p = agent_entry.path();
+            let Ok(meta) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                continue;
+            }
+            let is_agent_transcript = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("agent-"))
+                && p.extension().and_then(|e| e.to_str()) == Some("jsonl");
+            if is_agent_transcript {
+                files.push(p);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ===== par_map_bounded Tests =====
+
+    #[test]
+    fn test_par_map_bounded_preserves_input_order() {
+        let items: Vec<usize> = (0..100).collect();
+        let out = par_map_bounded(items, |i| i * 2);
+        assert_eq!(out, (0..100).map(|i| i * 2).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_par_map_bounded_handles_empty_and_single() {
+        assert!(par_map_bounded(Vec::<u8>::new(), |i| i).is_empty());
+        assert_eq!(par_map_bounded(vec![7u8], |i| i + 1), vec![8]);
+    }
+
+    // ===== Line Utils Tests =====
+
+    #[test]
+    fn test_find_line_ranges_empty() {
+        let data = b"";
+        let ranges = find_line_ranges(data);
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn test_find_line_ranges_single_line_no_newline() {
+        let data = b"hello world";
+        let ranges = find_line_ranges(data);
+        assert_eq!(ranges, vec![(0, 11)]);
+    }
+
+    #[test]
+    fn test_find_line_ranges_single_line_with_newline() {
+        let data = b"hello world\n";
+        let ranges = find_line_ranges(data);
+        assert_eq!(ranges, vec![(0, 11)]);
+    }
+
+    #[test]
+    fn test_find_line_ranges_multiple_lines() {
+        let data = b"line1\nline2\nline3";
+        let ranges = find_line_ranges(data);
+        assert_eq!(ranges, vec![(0, 5), (6, 11), (12, 17)]);
+    }
+
+    #[test]
+    fn test_find_line_ranges_with_empty_lines() {
+        let data = b"line1\n\nline3\n";
+        let ranges = find_line_ranges(data);
+        // Empty lines are skipped (start == end after newline)
+        assert_eq!(ranges, vec![(0, 5), (7, 12)]);
+    }
+
+    #[test]
+    fn test_find_line_ranges_only_newlines() {
+        let data = b"\n\n\n";
+        let ranges = find_line_ranges(data);
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn test_find_line_starts_empty() {
+        let data = b"";
+        let starts = find_line_starts(data);
+        assert_eq!(starts, vec![0]);
+    }
+
+    #[test]
+    fn test_find_line_starts_single_line() {
+        let data = b"hello";
+        let starts = find_line_starts(data);
+        assert_eq!(starts, vec![0]);
+    }
+
+    #[test]
+    fn test_find_line_starts_multiple_lines() {
+        let data = b"line1\nline2\nline3";
+        let starts = find_line_starts(data);
+        assert_eq!(starts, vec![0, 6, 12]);
+    }
+
+    // ===== Project Name Tests =====
+
+    #[test]
+    fn test_extract_project_name_with_prefix() {
+        // Test raw project name with dash prefix (e.g., "-user-home-project")
+        let result = extract_project_name("-user-home-project");
+        assert_eq!(result, "project");
+    }
+
+    #[test]
+    fn test_extract_project_name_with_complex_prefix() {
+        // Test raw project name with multiple parts
+        let result = extract_project_name("-usr-local-myproject");
+        assert_eq!(result, "myproject");
+    }
+
+    #[test]
+    fn test_extract_project_name_without_prefix() {
+        // Test raw project name without dash prefix
+        let result = extract_project_name("simple-project");
+        assert_eq!(result, "simple-project");
+    }
+
+    #[test]
+    fn test_extract_project_name_empty() {
+        let result = extract_project_name("");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_extract_project_name_only_dashes() {
+        // When there are fewer than 4 parts, return original
+        let result = extract_project_name("-a-b");
+        assert_eq!(result, "-a-b");
+    }
+
+    #[test]
+    fn test_extract_project_name_exact_four_parts() {
+        let result = extract_project_name("-a-b-c");
+        assert_eq!(result, "c");
+    }
+
+    #[test]
+    fn test_extract_project_name_fallback_when_path_missing() {
+        // Guarantees we hit the splitn(4) fallback when filesystem decoding
+        // fails (deleted project, or path that never existed). Uses a sentinel
+        // prefix unlikely to ever exist on any developer machine.
+        let result = extract_project_name("-__cchv_definitely_missing_12345__-foo-bar-leafname");
+        assert_eq!(result, "bar-leafname");
+    }
+
+    /// Helper for deep-path tests: creates a nested directory tree under the
+    /// canonical temp dir, encodes it Claude-style, and returns the encoded
+    /// slug plus the root for cleanup. Canonicalization is required because
+    /// the decoder rejects symlinked path components (macOS `/var` →
+    /// `/private/var`).
+    fn make_encoded_path(root_name: &str, segments: &[&str]) -> (String, std::path::PathBuf) {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonicalize temp dir")
+            .join(root_name);
+        let mut deep = root.clone();
+        for s in segments {
+            deep = deep.join(s);
+        }
+        std::fs::create_dir_all(&deep).expect("create deep tmp dir");
+        // `canonicalize()` on Windows returns an extended-length UNC path
+        // (`\\?\C:\Users\...`).
+        // Real Claude-generated project slugs never carry that verbatim
+        // prefix -- strip it here so the fixture matches what production
+        // data actually looks like, rather than testing an artifact of
+        // this one canonicalization call.
+        let deep_str = deep.to_string_lossy();
+        let deep_str = deep_str.strip_prefix(r"\\?\").unwrap_or(&deep_str);
+        // Normalize both Unix and Windows separators so the encoded slug
+        // matches Claude's leading-dash convention regardless of host OS.
+        let mut encoded = deep_str.replace(['/', '\\'], "-");
+        if !encoded.starts_with('-') {
+            encoded.insert(0, '-');
+        }
+        (encoded, root)
+    }
+
+    #[test]
+    fn test_extract_project_name_deep_path() {
+        // Paths deeper than 3 segments (e.g. ~/Projects/{Host}/{Org}/{Repo})
+        // must return just the leaf, not the encoded suffix.
+        let (encoded, root) = make_encoded_path(
+            "cchv_extract_deep_test",
+            &["Projects", "GitHub", "org", "repo"],
+        );
+        let result = extract_project_name(&encoded);
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(result, "repo");
+    }
+
+    #[test]
+    fn test_extract_project_name_with_hyphens_in_segments() {
+        // Real-world example: a deep path where directory names themselves
+        // contain hyphens. The encoded slug is ambiguous (every hyphen could
+        // be a separator OR part of a name), so this can only resolve
+        // correctly via filesystem existence checks.
+        let (encoded, root) = make_encoded_path(
+            "cchv_extract_hyphens_test",
+            &[
+                "Projects",
+                "internal.github.acme.com",
+                "dumb-department-name",
+                "dummy-app-microservice-apple",
+            ],
+        );
+        let result = extract_project_name(&encoded);
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(result, "dummy-app-microservice-apple");
+    }
+
+    #[test]
+    fn test_estimate_message_count_zero_size() {
+        // Minimum should be 1
+        let result = estimate_message_count_from_size(0);
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn test_estimate_message_count_small_file() {
+        // 500 bytes -> ceil(0.5) = 1
+        let result = estimate_message_count_from_size(500);
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn test_estimate_message_count_medium_file() {
+        // 2500 bytes -> ceil(2.5) = 3
+        let result = estimate_message_count_from_size(2500);
+        assert_eq!(result, 3);
+    }
+
+    #[test]
+    fn test_estimate_message_count_large_file() {
+        // 10000 bytes -> ceil(10.0) = 10
+        let result = estimate_message_count_from_size(10000);
+        assert_eq!(result, 10);
+    }
+
+    #[test]
+    fn test_estimate_message_count_exact_boundary() {
+        // 1000 bytes -> ceil(1.0) = 1
+        let result = estimate_message_count_from_size(1000);
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn test_parse_rfc3339_utc_supports_z_and_offset() {
+        let z = parse_rfc3339_utc("2026-02-20T05:00:00Z");
+        let offset = parse_rfc3339_utc("2026-02-20T05:00:00+00:00");
+        assert_eq!(z, offset);
+    }
+
+    #[test]
+    fn test_search_json_value_case_insensitive_ignores_keys() {
+        let value = serde_json::json!({
+            "type": "text",
+            "nested": {
+                "label": "Hello World"
+            }
+        });
+        assert!(!search_json_value_case_insensitive(&value, "type"));
+        assert!(search_json_value_case_insensitive(&value, "hello"));
+    }
+
+    // ===== Git Worktree Detection Tests =====
+
+    #[test]
+    fn test_decode_project_path_session_storage() {
+        assert_eq!(
+            decode_project_path("/Users/jack/.claude/projects/-Users-jack-my-project"),
+            "/Users/jack/my-project"
+        );
+    }
+
+    #[test]
+    fn test_decode_project_path_tmp() {
+        assert_eq!(
+            decode_project_path("/Users/jack/.claude/projects/-tmp-feature-my-project"),
+            "/tmp/feature/my-project"
+        );
+    }
+
+    #[test]
+    fn test_decode_project_path_regular() {
+        assert_eq!(decode_project_path("/some/other/path"), "/some/other/path");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_decode_project_path_verified_resolves_existing_folder() {
+        // `/usr/lib` exists on macOS and Linux and contains no dashes, so the
+        // dash-decoder can resolve it against the real filesystem. There is
+        // no Windows equivalent of this exact assertion -- this is a
+        // genuine platform-specific test, not a fixture to fix, since
+        // Windows has no bare `/usr/lib`-shaped absolute path at all.
+        assert_eq!(
+            decode_project_path_verified("/Users/whoever/.claude/projects/-usr-lib"),
+            Some("/usr/lib".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decode_project_path_verified_none_for_nonexistent() {
+        // This encoded folder name does not resolve to any real directory, so
+        // there is no verified result (callers fall back to the JSONL `cwd`).
+        assert_eq!(
+            decode_project_path_verified(
+                "/Users/whoever/.claude/projects/-this-does-not-exist-anywhere-xyzzy"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_decode_project_path_verified_none_without_marker() {
+        // Paths outside the `.claude/projects/` layout cannot be decoded.
+        assert_eq!(decode_project_path_verified("/some/other/path"), None);
+    }
+
+    #[test]
+    fn test_extract_main_git_dir_valid() {
+        assert_eq!(
+            extract_main_git_dir("/Users/jack/main/.git/worktrees/feature"),
+            Some("/Users/jack/main/.git".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_main_git_dir_invalid() {
+        assert_eq!(extract_main_git_dir("/some/path/without/worktrees"), None);
+    }
+
+    #[test]
+    fn test_detect_git_worktree_info_not_git() {
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        // No .git file or directory
+
+        let result = detect_git_worktree_info(temp_dir.path().to_str().unwrap());
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info.worktree_type, GitWorktreeType::NotGit);
+    }
+
+    #[test]
+    fn test_detect_git_worktree_info_main_repo() {
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let git_dir = temp_dir.path().join(".git");
+        fs::create_dir(&git_dir).unwrap();
+
+        let result = detect_git_worktree_info(temp_dir.path().to_str().unwrap());
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info.worktree_type, GitWorktreeType::Main);
+        assert!(info.main_project_path.is_none());
+    }
+
+    #[test]
+    fn test_detect_git_worktree_info_linked() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let git_file = temp_dir.path().join(".git");
+        let mut file = fs::File::create(&git_file).unwrap();
+        writeln!(
+            file,
+            "gitdir: /Users/jack/main-project/.git/worktrees/feature-branch"
+        )
+        .unwrap();
+
+        let result = detect_git_worktree_info(temp_dir.path().to_str().unwrap());
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info.worktree_type, GitWorktreeType::Linked);
+        assert_eq!(
+            info.main_project_path,
+            Some("/Users/jack/main-project".to_string())
+        );
+    }
+
+    /// Claude Code Workflows store their sub-agent transcripts one level
+    /// deeper than regular subagents: `{uuid}/subagents/workflows/wf_*/agent-*.jsonl`
+    /// (issue #449). Only `agent-*.jsonl` counts — each run also has a
+    /// `journal.jsonl` that is orchestration metadata, not a conversation.
+    #[test]
+    fn test_find_subagent_files_includes_workflow_agents() {
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let session_path = temp_dir.path().join("abc123.jsonl");
+        fs::write(&session_path, "{}\n").unwrap();
+
+        let subagents = temp_dir.path().join("abc123").join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(subagents.join("agent-flat1.jsonl"), "{}\n").unwrap();
+
+        let run_dir = subagents.join("workflows").join("wf_1a198a78-3be");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(run_dir.join("agent-nested1.jsonl"), "{}\n").unwrap();
+        fs::write(run_dir.join("agent-nested1.meta.json"), "{}").unwrap();
+        fs::write(run_dir.join("journal.jsonl"), "{}\n").unwrap();
+
+        let files = find_subagent_files(&session_path);
+        let names: Vec<String> = files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+
+        assert!(names.contains(&"agent-flat1.jsonl".to_string()));
+        assert!(names.contains(&"agent-nested1.jsonl".to_string()));
+        assert!(
+            !names.contains(&"journal.jsonl".to_string()),
+            "journal.jsonl is workflow metadata, not a subagent transcript"
+        );
+        assert_eq!(files.len(), 2);
+    }
+}

@@ -1,0 +1,3710 @@
+use super::ProviderInfo;
+use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession, TokenUsage};
+use crate::utils::{
+    build_provider_message, estimate_message_count_from_size, find_line_ranges, par_map_bounded,
+    search_json_value_case_insensitive, search_result_priority,
+};
+use chrono::{DateTime, Utc};
+use memchr::{memchr2_iter, memchr_iter, memmem};
+use memmap2::Mmap;
+use rusqlite::{Connection, OpenFlags};
+use serde_json::Value;
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::fs::{self, File};
+use rayon::prelude::*;
+use std::path::Path;
+use std::path::PathBuf;
+use walkdir::WalkDir;
+
+use crate::commands::session::apply_search_filters;
+
+const STATE_DB_FILENAME: &str = "state_5.sqlite";
+
+/// Detect Codex CLI installation
+pub fn detect() -> Option<ProviderInfo> {
+    let base_path = get_base_path()?;
+    let sessions_path = Path::new(&base_path).join("sessions");
+    let archived_sessions_path = Path::new(&base_path).join("archived_sessions");
+
+    Some(ProviderInfo {
+        id: "codex".to_string(),
+        display_name: "Codex CLI".to_string(),
+        base_path: base_path.clone(),
+        is_available: (sessions_path.exists() && sessions_path.is_dir())
+            || (archived_sessions_path.exists() && archived_sessions_path.is_dir()),
+    })
+}
+
+/// Get the Codex base path
+pub fn get_base_path() -> Option<String> {
+    // Check $CODEX_HOME first
+    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+        let path = PathBuf::from(&codex_home);
+        if path.exists() {
+            return Some(codex_home);
+        }
+    }
+
+    // Default: ~/.codex
+    let home = crate::utils::resolve_home_dir()?;
+    let codex_path = home.join(".codex");
+    if codex_path.exists() {
+        Some(codex_path.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+fn get_sessions_dir() -> Result<PathBuf, String> {
+    let base_path = get_base_path().ok_or_else(|| "Codex not found".to_string())?;
+    Ok(Path::new(&base_path).join("sessions"))
+}
+
+fn get_archived_sessions_dir() -> Result<PathBuf, String> {
+    let base_path = get_base_path().ok_or_else(|| "Codex not found".to_string())?;
+    Ok(Path::new(&base_path).join("archived_sessions"))
+}
+
+fn get_existing_session_dirs() -> Result<Vec<PathBuf>, String> {
+    let sessions_dir = get_sessions_dir()?;
+    let archived_sessions_dir = get_archived_sessions_dir()?;
+
+    Ok([sessions_dir, archived_sessions_dir]
+        .into_iter()
+        .filter(|path| path.exists() && path.is_dir())
+        .collect())
+}
+
+// Codex generates these filenames itself, always lowercase — a
+// case-insensitive comparison would accept files Codex never writes.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+pub(crate) fn is_rollout_jsonl(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with("rollout-")
+                && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
+        })
+}
+
+/// Discovery filter for session walkers: accepts every rollout
+/// [`is_rollout_jsonl`] does, but skips a compressed `.jsonl.zst` whose plain
+/// `.jsonl` twin exists — Codex materializes the plain file for appends, so
+/// the plain one is the current version and listing both would duplicate the
+/// session.
+pub(crate) fn is_discoverable_rollout(path: &Path) -> bool {
+    if !is_rollout_jsonl(path) {
+        return false;
+    }
+    let is_compressed = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl.zst"));
+    if is_compressed {
+        // "rollout-….jsonl.zst" → "rollout-….jsonl"
+        let plain = path.with_extension("");
+        if plain.exists() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Rollout file contents as a linear byte buffer: an mmap for plain `.jsonl`,
+/// a decompressed buffer for `.jsonl.zst` (Codex compresses old rollouts).
+enum RolloutBytes {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for RolloutBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            RolloutBytes::Mapped(mmap) => mmap,
+            RolloutBytes::Owned(bytes) => bytes,
+        }
+    }
+}
+
+#[allow(unsafe_code)] // Required for mmap performance optimization
+fn read_rollout_bytes(path: &Path) -> Result<RolloutBytes, String> {
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let is_compressed = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl.zst"));
+    if is_compressed {
+        return zstd::decode_all(std::io::BufReader::new(file))
+            .map(RolloutBytes::Owned)
+            .map_err(|e| format!("Failed to decompress rollout: {e}"));
+    }
+    // SAFETY: File is read-only and we only read from the mapping
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+    Ok(RolloutBytes::Mapped(mmap))
+}
+
+/// Return true when `session_path` is a Codex rollout JSONL inside the active
+/// or archived session roots.
+pub fn is_session_path(session_path: &str) -> bool {
+    let path = Path::new(session_path);
+    validate_session_path(path, session_path)
+        .map(|canonical_path| is_rollout_jsonl(&canonical_path))
+        .unwrap_or(false)
+}
+
+fn validate_session_path(session_path: &Path, raw_session_path: &str) -> Result<PathBuf, String> {
+    let canonical_session = session_path
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve session path: {e}"))?;
+
+    let mut canonical_session_dirs = Vec::new();
+    for dir in [get_sessions_dir()?, get_archived_sessions_dir()?] {
+        if !dir.exists() || !dir.is_dir() {
+            continue;
+        }
+        canonical_session_dirs.push(
+            dir.canonicalize()
+                .map_err(|e| format!("Failed to resolve Codex session directory: {e}"))?,
+        );
+    }
+
+    if canonical_session_dirs.is_empty() {
+        return Err("No Codex session directories found".to_string());
+    }
+
+    let is_allowed = canonical_session_dirs
+        .iter()
+        .any(|allowed_dir| canonical_session.starts_with(allowed_dir));
+
+    if !is_allowed {
+        return Err(format!(
+            "Session path is outside Codex session directories: {raw_session_path}"
+        ));
+    }
+
+    Ok(canonical_session)
+}
+
+/// Session metadata extracted from rollout files. `pub(crate)` so providers
+/// that share the Codex rollout format (e.g. Open Interpreter) can reuse the
+/// extractors below.
+pub(crate) struct SessionInfo {
+    pub(crate) session_id: String,
+    pub(crate) cwd: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) message_count: usize,
+    pub(crate) first_message_time: String,
+    pub(crate) last_message_time: String,
+    pub(crate) last_modified: String,
+    pub(crate) file_path: String,
+    pub(crate) has_tool_use: bool,
+    pub(crate) summary: Option<String>,
+}
+
+/// Lightweight metadata used by project-level scans.
+pub(crate) struct ProjectScanInfo {
+    pub(crate) cwd: Option<String>,
+    pub(crate) message_count: usize,
+    pub(crate) last_modified: String,
+}
+
+/// Scan Codex projects from a specific base path.
+pub fn scan_projects_from_path(base_path: &str) -> Result<Vec<ClaudeProject>, String> {
+    crate::utils::require_absolute_path(base_path, "Codex base path")?;
+    let base = Path::new(base_path);
+
+    let sessions_dir = base.join("sessions");
+    let archived_sessions_dir = base.join("archived_sessions");
+
+    let session_dirs: Vec<PathBuf> = [sessions_dir, archived_sessions_dir]
+        .into_iter()
+        .filter(|path| {
+            std::fs::symlink_metadata(path)
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if session_dirs.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Group sessions by cwd
+    let mut project_map: HashMap<String, Vec<ProjectScanInfo>> = HashMap::new();
+
+    for session_dir in session_dirs {
+        for entry in WalkDir::new(session_dir)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| is_discoverable_rollout(e.path()))
+        {
+            let rollout_path = entry.path();
+
+            if let Ok(info) = extract_project_scan_info(rollout_path) {
+                let cwd = info.cwd.clone().unwrap_or_else(|| "unknown".to_string());
+                project_map.entry(cwd).or_default().push(info);
+            }
+        }
+    }
+
+    let mut projects: Vec<ClaudeProject> = project_map
+        .into_iter()
+        .map(|(cwd, sessions)| {
+            let name = Path::new(&cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| cwd.clone());
+
+            let session_count = sessions.len();
+            let message_count: usize = sessions.iter().map(|s| s.message_count).sum();
+            let last_modified = sessions
+                .iter()
+                .map(|s| s.last_modified.as_str())
+                .max()
+                .unwrap_or("")
+                .to_string();
+
+            ClaudeProject {
+                name,
+                path: format!("codex://{cwd}"),
+                actual_path: cwd,
+                session_count,
+                message_count,
+                last_modified,
+                git_info: None,
+                provider: Some("codex".to_string()),
+                storage_type: None,
+                custom_directory_label: None,
+            }
+        })
+        .collect();
+
+    projects.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    Ok(projects)
+}
+
+/// Scan Codex projects from the default location.
+pub fn scan_projects() -> Result<Vec<ClaudeProject>, String> {
+    let base = get_base_path().ok_or("Codex base path not found")?;
+    scan_projects_from_path(&base)
+}
+
+/// Walk the whole Codex session store exactly once, extracting a (cached)
+/// [`SessionInfo`] for every rollout file regardless of which project it
+/// belongs to. `load_sessions` and [`collect_global_stats_sessions`] both
+/// build on this -- neither re-walks or re-stat-checks the store per call.
+///
+/// This split matters specifically because `load_sessions` used to be
+/// called once *per project* from global stats collection: even with
+/// `extract_session_info_cached` making the per-file parse free on a
+/// repeat call, the walk + `fs::canonicalize`/`fs::metadata` stat check
+/// still ran on all ~400 files on *every* call. Confirmed on a real
+/// machine with hundreds of Codex projects (one per distinct working
+/// directory Codex was ever run from): each individually-fast (~20-50ms)
+/// per-project call still multiplied out to 10+ seconds of total Codex
+/// time in `get_global_stats_summary`. `collect_global_stats_sessions`
+/// exists to call this exactly once for the whole store instead.
+fn scan_all_session_info() -> Vec<std::sync::Arc<SessionInfo>> {
+    let Ok(session_dirs) = get_existing_session_dirs() else {
+        return Vec::new();
+    };
+    if session_dirs.is_empty() {
+        return Vec::new();
+    }
+
+    let rollout_paths: Vec<PathBuf> = session_dirs
+        .into_iter()
+        .flat_map(|session_dir| {
+            WalkDir::new(session_dir)
+                .min_depth(1)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_file())
+                .filter(|e| is_discoverable_rollout(e.path()))
+                .map(|e| e.path().to_path_buf())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    rollout_paths
+        .par_iter()
+        .filter_map(|rollout_path| extract_session_info_cached(rollout_path).ok())
+        .collect()
+}
+
+fn session_info_to_claude_session(
+    info: &SessionInfo,
+    project_name: &str,
+    title_index: &HashMap<String, String>,
+) -> ClaudeSession {
+    let native_title = title_index.get(&info.session_id);
+    ClaudeSession {
+        session_id: info.file_path.clone(),
+        actual_session_id: info.session_id.clone(),
+        file_path: info.file_path.clone(),
+        project_name: project_name.to_string(),
+        message_count: info.message_count,
+        first_message_time: info.first_message_time.clone(),
+        last_message_time: info.last_message_time.clone(),
+        last_modified: info.last_modified.clone(),
+        has_tool_use: info.has_tool_use,
+        has_errors: false,
+        summary: native_title.cloned().or_else(|| info.summary.clone()),
+        is_renamed: native_title.is_some(),
+        provider: Some("codex".to_string()),
+        storage_type: None,
+        entrypoint: None,
+    }
+}
+
+/// Load sessions for a Codex project (filtered by cwd)
+pub fn load_sessions(
+    project_path: &str,
+    _exclude_sidechain: bool,
+) -> Result<Vec<ClaudeSession>, String> {
+    let title_index = get_base_path()
+        .map(|base_path| load_native_title_index(&base_path))
+        .unwrap_or_default();
+
+    // Extract cwd from virtual path "codex://{cwd}"
+    let target_cwd = project_path
+        .strip_prefix("codex://")
+        .unwrap_or(project_path);
+    let project_name = Path::new(target_cwd)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let mut sessions: Vec<ClaudeSession> = scan_all_session_info()
+        .iter()
+        .filter(|info| info.cwd.as_deref().unwrap_or("unknown") == target_cwd)
+        .map(|info| session_info_to_claude_session(info, &project_name, &title_index))
+        .collect();
+
+    sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    Ok(sessions)
+}
+
+/// All Codex sessions across every project, paired with the raw cwd each
+/// belongs to, from exactly one scan of the session store. Used by
+/// `commands::stats::collect_provider_global_file_stats`'s Codex branch so
+/// a global stats load never re-walks the store once per project -- see
+/// [`scan_all_session_info`]'s doc for why that mattered.
+pub fn collect_global_stats_sessions() -> Vec<(String, ClaudeSession)> {
+    let title_index = get_base_path()
+        .map(|base_path| load_native_title_index(&base_path))
+        .unwrap_or_default();
+
+    scan_all_session_info()
+        .iter()
+        .map(|info| {
+            let cwd = info.cwd.clone().unwrap_or_else(|| "unknown".to_string());
+            let project_name = Path::new(&cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let session = session_info_to_claude_session(info, &project_name, &title_index);
+            (cwd, session)
+        })
+        .collect()
+}
+
+/// Same one-scan walk as [`collect_global_stats_sessions`], for
+/// `commands::history`'s cross-provider session list -- kept as a separate
+/// function rather than widening that one's return shape, since
+/// `ClaudeSession` carries no `model` field and this codebase deliberately
+/// avoids widening that type for one feature's sake (see
+/// `models::history`'s module doc). `SessionInfo::model` is already
+/// extracted by `extract_session_info` (previously unused) -- real model
+/// data for Codex sessions, essentially free.
+pub fn collect_global_history_sessions() -> Vec<(String, ClaudeSession, Option<String>)> {
+    let title_index = get_base_path()
+        .map(|base_path| load_native_title_index(&base_path))
+        .unwrap_or_default();
+
+    scan_all_session_info()
+        .iter()
+        .map(|info| {
+            let cwd = info.cwd.clone().unwrap_or_else(|| "unknown".to_string());
+            let project_name = Path::new(&cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let session = session_info_to_claude_session(info, &project_name, &title_index);
+            (cwd, session, info.model.clone())
+        })
+        .collect()
+}
+
+/// Load all messages from a Codex rollout file
+pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
+    let path = Path::new(session_path);
+    if !path.exists() {
+        return Err(format!("Session file not found: {session_path}"));
+    }
+    let canonical_path = validate_session_path(path, session_path)?;
+    parse_rollout_file(&canonical_path)
+}
+
+/// Parse an already-validated Codex rollout JSONL file into messages. Pure of
+/// base-path/scheme concerns so providers sharing the identical rollout format
+/// (e.g. Open Interpreter) can validate against their own root, call this, and
+/// re-tag the provider on the result.
+#[allow(unsafe_code)] // Required for mmap performance optimization
+pub(crate) fn parse_rollout_file(canonical_path: &Path) -> Result<Vec<ClaudeMessage>, String> {
+    let mmap = read_rollout_bytes(canonical_path)?;
+    let ranges = find_line_ranges(&mmap);
+
+    let mut messages = Vec::new();
+    // Filename-derived fallback id; the first session_meta overrides it
+    // (meta-less rollouts keep it — issue #451 follow-up).
+    let mut session_id = session_id_from_rollout_filename(canonical_path).unwrap_or_default();
+    let mut meta_seen = false;
+    let mut current_model: Option<String> = None;
+    let mut prev_input_tokens: u32 = 0;
+    let mut prev_output_tokens: u32 = 0;
+    let mut prev_cached_tokens: u32 = 0;
+    let mut msg_counter = 0u64;
+
+    for &(start, end) in &ranges {
+        let line = &mmap[start..end];
+        let mut buf = line.to_vec();
+        let val: Value = match simd_json::from_slice(&mut buf) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let line_timestamp = val
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let line_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match line_type {
+            // First session_meta only — later ones are history replayed by
+            // `codex fork` and must not re-tag messages with the source's id.
+            "session_meta" if !meta_seen => {
+                meta_seen = true;
+                if let Some(payload) = val.get("payload") {
+                    session_id = payload
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                }
+            }
+            "turn_context" => {
+                if let Some(payload) = val.get("payload") {
+                    if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
+                        current_model = Some(m.to_string());
+                    }
+                }
+            }
+            "response_item" => {
+                if let Some(payload) = val.get("payload") {
+                    if let Some(msg) = convert_codex_item(
+                        payload,
+                        &session_id,
+                        current_model.as_ref(),
+                        &line_timestamp,
+                        &mut msg_counter,
+                    ) {
+                        if try_merge_tool_result_into_previous(&mut messages, &msg) {
+                            continue;
+                        }
+                        messages.push(msg);
+                    }
+                }
+            }
+            "event_msg" => {
+                if let Some(payload) = val.get("payload") {
+                    let event_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                    // Skip events that duplicate response_item messages.
+                    // Codex logs user/assistant text in both response_item (type=message)
+                    // and event_msg (type=user_message / agent_message) — only keep
+                    // the response_item version to avoid showing every message twice.
+                    if event_type == "user_message" || event_type == "agent_message" {
+                        continue;
+                    }
+
+                    if event_type == "token_count" {
+                        let usage_totals = extract_token_totals(payload)
+                            .or_else(|| extract_last_token_usage(payload));
+                        let Some((input, output, cached)) = usage_totals else {
+                            continue;
+                        };
+
+                        let (delta_input, delta_output, delta_cached) =
+                            if prev_input_tokens == 0 && prev_output_tokens == 0 {
+                                (input, output, cached)
+                            } else {
+                                (
+                                    input.saturating_sub(prev_input_tokens),
+                                    output.saturating_sub(prev_output_tokens),
+                                    cached.saturating_sub(prev_cached_tokens),
+                                )
+                            };
+                        prev_input_tokens = input;
+                        prev_output_tokens = output;
+                        prev_cached_tokens = cached;
+
+                        // Separate non-cached input from cached input for correct billing.
+                        // OpenAI's input_tokens includes cached_input_tokens as a subset,
+                        // but they are billed at different rates (cached gets 90% discount).
+                        let non_cached_input = delta_input.saturating_sub(delta_cached);
+
+                        // Apply to last assistant message without usage
+                        if let Some(last_msg) = messages.last_mut() {
+                            if last_msg.message_type == "assistant" && last_msg.usage.is_none() {
+                                let service_tier = payload
+                                    .get("service_tier")
+                                    .or_else(|| payload.get("serviceTier"))
+                                    .or_else(|| {
+                                        payload
+                                            .get("usage")
+                                            .and_then(|usage| usage.get("service_tier"))
+                                    })
+                                    .and_then(|value| value.as_str())
+                                    .map(str::to_string);
+                                last_msg.usage = Some(TokenUsage {
+                                    input_tokens: Some(non_cached_input),
+                                    output_tokens: Some(delta_output),
+                                    cache_creation_input_tokens: None,
+                                    cache_read_input_tokens: Some(delta_cached),
+                                    reasoning_tokens: None,
+                                    service_tier,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    } else if let Some(msg) =
+                        convert_codex_event(payload, &session_id, &line_timestamp, &mut msg_counter)
+                    {
+                        messages.push(msg);
+                    }
+                }
+            }
+            "compacted" => {
+                if let Some(payload) = val.get("payload") {
+                    let msg = convert_codex_compacted(
+                        payload,
+                        &session_id,
+                        &line_timestamp,
+                        &mut msg_counter,
+                    );
+                    messages.push(msg);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(messages)
+}
+
+fn project_name_for_rollout(rollout_path: &Path) -> Option<String> {
+    let cwd = extract_session_cwd(rollout_path).ok().flatten()?;
+    Path::new(&cwd)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .or_else(|| (!cwd.is_empty()).then_some(cwd))
+}
+
+fn bytes_contain_query_case_insensitive(haystack: &[u8], query: &[u8]) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    if haystack.len() < query.len() {
+        return false;
+    }
+
+    let first_lower = query[0].to_ascii_lowercase();
+    let first_upper = query[0].to_ascii_uppercase();
+    let matches_at = |start: usize| {
+        haystack
+            .get(start..start + query.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(query))
+    };
+
+    if first_lower == first_upper {
+        memchr_iter(first_lower, haystack).any(matches_at)
+    } else {
+        memchr2_iter(first_lower, first_upper, haystack).any(matches_at)
+    }
+}
+
+fn rollout_might_contain_query(rollout_path: &Path, query_lower: &str) -> bool {
+    let Ok(bytes) = read_rollout_bytes(rollout_path) else {
+        return false;
+    };
+
+    for &(start, end) in &find_line_ranges(&bytes) {
+        let line = &bytes[start..end];
+        let raw_match = if query_lower.is_ascii() {
+            bytes_contain_query_case_insensitive(line, query_lower.as_bytes())
+        } else {
+            String::from_utf8_lossy(line)
+                .to_lowercase()
+                .contains(query_lower)
+        };
+        // A JSON escape can hide a decoded match from the raw byte scan, for
+        // example `\u0077allpaper`. Parse escaped lines before rejecting them.
+        if !raw_match && !line.contains(&b'\\') {
+            continue;
+        }
+
+        let mut buf = line.to_vec();
+        let Ok(value) = simd_json::from_slice::<Value>(&mut buf) else {
+            continue;
+        };
+        let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+
+        let searchable = match line_type {
+            "response_item" => {
+                let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+                if payload_type == "message" {
+                    let role = payload
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .unwrap_or("user");
+                    if role != "user" && role != "assistant" {
+                        continue;
+                    }
+                }
+                search_json_value_case_insensitive(payload, query_lower)
+            }
+            "event_msg" => {
+                let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+                event_type != "user_message"
+                    && event_type != "agent_message"
+                    && search_json_value_case_insensitive(payload, query_lower)
+            }
+            "compacted" => "conversation compacted".contains(query_lower),
+            _ => false,
+        };
+        if searchable {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_searchable_codex_result(message: &ClaudeMessage) -> bool {
+    !matches!(message.role.as_deref(), Some("developer" | "system"))
+}
+
+fn compare_search_timestamps_desc(a: &ClaudeMessage, b: &ClaudeMessage) -> Ordering {
+    match (
+        DateTime::parse_from_rfc3339(&a.timestamp),
+        DateTime::parse_from_rfc3339(&b.timestamp),
+    ) {
+        (Ok(a_ts), Ok(b_ts)) => b_ts.cmp(&a_ts),
+        (Ok(_), Err(_)) => Ordering::Less,
+        (Err(_), Ok(_)) => Ordering::Greater,
+        (Err(_), Err(_)) => b.timestamp.cmp(&a.timestamp),
+    }
+}
+
+fn retain_newest_search_results(results: &mut Vec<ClaudeMessage>, limit: usize) {
+    if results.len() > limit {
+        results.sort_unstable_by(compare_search_timestamps_desc);
+        results.truncate(limit);
+    }
+}
+
+/// Search Codex sessions for a query string.
+///
+/// Filters are applied before the result cap, and displayable conversation
+/// text is kept ahead of tool-only matches so verbose tool transcripts cannot
+/// crowd the user's prompt or the assistant's reply out of global search.
+pub fn search(query: &str, limit: usize, filters: &Value) -> Result<Vec<ClaudeMessage>, String> {
+    let session_dirs = get_existing_session_dirs()?;
+
+    if session_dirs.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let query_lower = query.to_lowercase();
+    let mut ranked_results: [Vec<ClaudeMessage>; 4] = std::array::from_fn(|_| Vec::new());
+    let rollout_paths: Vec<PathBuf> = session_dirs
+        .into_iter()
+        .flat_map(|session_dir| {
+            WalkDir::new(session_dir)
+                .min_depth(1)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
+                .filter(|entry| is_discoverable_rollout(entry.path()))
+                .map(walkdir::DirEntry::into_path)
+        })
+        .collect();
+
+    let candidate_paths: Vec<PathBuf> = par_map_bounded(rollout_paths, |rollout_path| {
+        rollout_might_contain_query(&rollout_path, &query_lower).then_some(rollout_path)
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let matches_by_file = par_map_bounded(candidate_paths, |rollout_path| {
+        let Ok(messages) = load_messages(&rollout_path.to_string_lossy()) else {
+            return Vec::new();
+        };
+        let mut file_results: Vec<ClaudeMessage> = messages
+            .into_iter()
+            .filter(|msg| {
+                is_searchable_codex_result(msg)
+                    && msg.content.as_ref().is_some_and(|content| {
+                        search_json_value_case_insensitive(content, &query_lower)
+                    })
+            })
+            .collect();
+
+        if !file_results.is_empty() {
+            let project_name = project_name_for_rollout(&rollout_path);
+            for msg in &mut file_results {
+                msg.project_name.clone_from(&project_name);
+            }
+        }
+        apply_search_filters(file_results, filters)
+    });
+
+    for file_results in matches_by_file {
+        for msg in file_results {
+            let priority = search_result_priority(&msg, &query_lower);
+            ranked_results[priority].push(msg);
+        }
+        for bucket in &mut ranked_results {
+            retain_newest_search_results(bucket, limit);
+        }
+    }
+
+    let mut results = Vec::new();
+    for mut bucket in ranked_results {
+        bucket.sort_unstable_by(compare_search_timestamps_desc);
+        bucket.truncate(limit.saturating_sub(results.len()));
+        results.extend(bucket);
+        if results.len() == limit {
+            break;
+        }
+    }
+
+    Ok(results)
+}
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+const JSON_TYPE_KEY: &[u8] = b"\"type\"";
+fn skip_json_ws(bytes: &[u8], mut index: usize) -> usize {
+    while bytes
+        .get(index)
+        .is_some_and(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        index += 1;
+    }
+    index
+}
+
+fn has_json_string_field_value(line: &[u8], key: &[u8], value: &[u8]) -> bool {
+    let mut search_offset = 0;
+    while search_offset < line.len() {
+        let Some(relative_pos) = memmem::find(&line[search_offset..], key) else {
+            return false;
+        };
+
+        let mut index = search_offset + relative_pos + key.len();
+        index = skip_json_ws(line, index);
+        if line.get(index) != Some(&b':') {
+            search_offset = index.min(line.len());
+            continue;
+        }
+
+        index = skip_json_ws(line, index + 1);
+        if line.get(index) != Some(&b'"') {
+            search_offset = index.min(line.len());
+            continue;
+        }
+
+        let value_start = index + 1;
+        let value_end = value_start + value.len();
+        if line.get(value_start..value_end) == Some(value) && line.get(value_end) == Some(&b'"') {
+            return true;
+        }
+
+        search_offset = value_end.min(line.len());
+    }
+
+    false
+}
+
+fn for_each_jsonl_line(data: &[u8], mut visit: impl FnMut(&[u8]) -> bool) {
+    let mut start = 0;
+    for end in memchr_iter(b'\n', data) {
+        let line_end = if end > start && data[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        if !visit(&data[start..line_end]) {
+            return;
+        }
+        start = end + 1;
+    }
+
+    if start < data.len() {
+        let line = &data[start..];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        visit(line);
+    }
+}
+
+fn parse_session_meta_cwd(line: &[u8]) -> Option<String> {
+    if !has_json_string_field_value(line, JSON_TYPE_KEY, b"session_meta") {
+        return None;
+    }
+
+    let mut buf = line.to_vec();
+    let val: Value = simd_json::from_slice(&mut buf).ok()?;
+    if val.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return None;
+    }
+
+    val.get("payload")?
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+/// cwd from a `turn_context` line, the fallback identity source for
+/// rollouts that carry no `session_meta` at all (issue #451 follow-up).
+fn parse_turn_context_cwd(line: &[u8]) -> Option<String> {
+    if !has_json_string_field_value(line, JSON_TYPE_KEY, b"turn_context") {
+        return None;
+    }
+
+    let mut buf = line.to_vec();
+    let val: Value = simd_json::from_slice(&mut buf).ok()?;
+    if val.get("type").and_then(|t| t.as_str()) != Some("turn_context") {
+        return None;
+    }
+
+    val.get("payload")?
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+/// Session id derived from the rollout filename
+/// (`rollout-<timestamp>-<uuid>.jsonl` → `<uuid>`); `None` when the stem
+/// doesn't end in a UUID.
+pub(crate) fn session_id_from_rollout_filename(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    // For "rollout-….jsonl.zst", file_stem still ends with ".jsonl".
+    let stem = stem.strip_suffix(".jsonl").unwrap_or(stem);
+    if stem.len() < 36 {
+        return None;
+    }
+    let tail = &stem[stem.len() - 36..];
+    let is_uuid = tail.bytes().enumerate().all(|(i, b)| match i {
+        8 | 13 | 18 | 23 => b == b'-',
+        _ => b.is_ascii_hexdigit(),
+    });
+    is_uuid.then(|| tail.to_string())
+}
+
+fn file_modified_rfc3339(path: &Path) -> String {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(|t| {
+            let dt: DateTime<Utc> = t.into();
+            dt.to_rfc3339()
+        })
+        .unwrap_or_else(|| Utc::now().to_rfc3339())
+}
+
+fn estimate_rollout_message_count(path: &Path) -> usize {
+    fs::metadata(path)
+        .map(|metadata| estimate_message_count_from_size(metadata.len()))
+        .unwrap_or(0)
+}
+
+#[allow(unsafe_code)] // Required for mmap performance optimization
+pub(crate) fn extract_session_cwd(rollout_path: &Path) -> Result<Option<String>, String> {
+    let mmap = read_rollout_bytes(rollout_path)?;
+
+    let mut cwd = None;
+    let mut turn_context_cwd = None;
+    for_each_jsonl_line(&mmap, |line| {
+        if let Some(found) = parse_session_meta_cwd(line) {
+            cwd = Some(found);
+            return false;
+        }
+        // Fallback for rollouts without any session_meta: the LAST
+        // turn_context's cwd is where the session actually runs (a fork
+        // replays the source's turn contexts first) — issue #451 follow-up.
+        if let Some(found) = parse_turn_context_cwd(line) {
+            turn_context_cwd = Some(found);
+        }
+        true
+    });
+
+    Ok(cwd.or(turn_context_cwd))
+}
+
+pub(crate) fn extract_project_scan_info(rollout_path: &Path) -> Result<ProjectScanInfo, String> {
+    Ok(ProjectScanInfo {
+        cwd: extract_session_cwd(rollout_path)?,
+        // Project list scans stay lightweight; session-level message counts
+        // are still computed exactly when the project is opened.
+        message_count: estimate_rollout_message_count(rollout_path),
+        last_modified: file_modified_rfc3339(rollout_path),
+    })
+}
+
+fn state_db_path(base_path: &str) -> PathBuf {
+    Path::new(base_path).join(STATE_DB_FILENAME)
+}
+
+fn open_state_db(base_path: &str) -> Option<Connection> {
+    let db_path = state_db_path(base_path);
+    if !db_path.is_file() {
+        return None;
+    }
+
+    Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()
+}
+
+fn load_native_title_index(base_path: &str) -> HashMap<String, String> {
+    let Some(conn) = open_state_db(base_path) else {
+        return HashMap::new();
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT id, title, first_user_message FROM threads") else {
+        return HashMap::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    }) else {
+        return HashMap::new();
+    };
+
+    rows.filter_map(std::result::Result::ok)
+        .filter_map(|(id, title, first_user_message)| {
+            let title = title.trim();
+            if title.is_empty() || title == first_user_message.trim() {
+                return None;
+            }
+            Some((id, title.to_string()))
+        })
+        .collect()
+}
+
+#[allow(unsafe_code)] // Required for mmap performance optimization
+pub(crate) fn extract_session_info(rollout_path: &Path) -> Result<SessionInfo, String> {
+    let mmap = read_rollout_bytes(rollout_path)?;
+    let ranges = find_line_ranges(&mmap);
+
+    let mut session_id = String::new();
+    let mut meta_seen = false;
+    let mut cwd = None;
+    let mut turn_context_cwd = None;
+    let mut model = None;
+    let mut message_count = 0usize;
+    let mut first_time = String::new();
+    let mut last_time = String::new();
+    let mut has_tool_use = false;
+    let mut summary = None;
+
+    for &(start, end) in &ranges {
+        let line = &mmap[start..end];
+        let mut buf = line.to_vec();
+        let val: Value = match simd_json::from_slice(&mut buf) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let line_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match line_type {
+            // Only the FIRST session_meta identifies the file. `codex fork`
+            // replays the source rollout verbatim into the new file, so a
+            // forked rollout contains the source's session_meta as history
+            // after its own — taking the last one misfiles the session under
+            // the source cwd (issue #451).
+            "session_meta" if !meta_seen => {
+                meta_seen = true;
+                if let Some(payload) = val.get("payload") {
+                    session_id = payload
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    cwd = payload
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                }
+            }
+            "turn_context" => {
+                if let Some(payload) = val.get("payload") {
+                    if model.is_none() {
+                        model = payload
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                    }
+                    // Last turn_context wins — the fallback cwd for
+                    // rollouts without any session_meta (issue #451).
+                    if let Some(tc_cwd) = payload.get("cwd").and_then(|v| v.as_str()) {
+                        turn_context_cwd = Some(tc_cwd.to_string());
+                    }
+                }
+            }
+            "response_item" => {
+                if let Some(payload) = val.get("payload") {
+                    let item_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if item_type == "message" {
+                        message_count += 1;
+
+                        let ts = payload
+                            .get("created_at")
+                            .or_else(|| val.get("timestamp"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        if first_time.is_empty() && !ts.is_empty() {
+                            first_time.clone_from(&ts);
+                        }
+                        if !ts.is_empty() {
+                            last_time.clone_from(&ts);
+                        }
+
+                        // Extract first user message as summary, skipping
+                        // auto-injected wrapper blocks (e.g. <environment_context>)
+                        // that codex CLI / Codex Desktop prepend to every session —
+                        // they are system context, not a real user prompt.
+                        if summary.is_none() {
+                            if let Some(role) = payload.get("role").and_then(|r| r.as_str()) {
+                                if role == "user" {
+                                    if let Some(text) = extract_text_from_content(payload) {
+                                        if !is_codex_auto_injected_user_text(&text) {
+                                            summary = Some(text);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if item_type == "local_shell_call"
+                        || item_type == "function_call"
+                        || item_type == "custom_tool_call"
+                        || item_type == "web_search_call"
+                    {
+                        has_tool_use = true;
+                        message_count += 1;
+                    } else if item_type == "function_call_output"
+                        || item_type == "custom_tool_call_output"
+                    {
+                        message_count += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let last_modified = if last_time.is_empty() {
+        file_modified_rfc3339(rollout_path)
+    } else {
+        last_time.clone()
+    };
+
+    // Meta-less rollout fallbacks (issue #451 follow-up): session id from
+    // the filename, cwd from the last turn_context.
+    if session_id.is_empty() {
+        if let Some(id) = session_id_from_rollout_filename(rollout_path) {
+            session_id = id;
+        }
+    }
+    if cwd.is_none() {
+        cwd = turn_context_cwd;
+    }
+
+    Ok(SessionInfo {
+        session_id,
+        cwd,
+        model,
+        message_count,
+        first_message_time: first_time,
+        last_message_time: last_time,
+        last_modified,
+        file_path: rollout_path.to_string_lossy().to_string(),
+        has_tool_use,
+        summary,
+    })
+}
+
+struct SessionInfoCacheEntry {
+    size: u64,
+    mtime: Option<std::time::SystemTime>,
+    info: std::sync::Arc<SessionInfo>,
+}
+
+static SESSION_INFO_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, SessionInfoCacheEntry>>> =
+    std::sync::OnceLock::new();
+
+fn session_info_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, SessionInfoCacheEntry>> {
+    SESSION_INFO_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Cached wrapper around [`extract_session_info`], validated by
+/// `(size, mtime)`, used only by [`scan_all_session_info`] -- every other
+/// caller (project scans, tests, other providers reusing the rollout
+/// format) still calls `extract_session_info` directly, unaffected. Falls
+/// back to an uncached extract for a path that can't be canonicalized or
+/// stat'ed (should not happen for a real rollout file, but never worth a
+/// hard failure over).
+fn extract_session_info_cached(rollout_path: &Path) -> Result<std::sync::Arc<SessionInfo>, String> {
+    let Ok(key) = fs::canonicalize(rollout_path) else {
+        return extract_session_info(rollout_path).map(std::sync::Arc::new);
+    };
+    let Ok(metadata) = fs::metadata(&key) else {
+        return extract_session_info(rollout_path).map(std::sync::Arc::new);
+    };
+    let size = metadata.len();
+    let mtime = metadata.modified().ok();
+
+    {
+        let cache = match session_info_cache().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(entry) = cache.get(&key) {
+            if entry.size == size && entry.mtime == mtime {
+                return Ok(std::sync::Arc::clone(&entry.info));
+            }
+        }
+    }
+
+    let info = std::sync::Arc::new(extract_session_info(rollout_path)?);
+
+    let mut cache = match session_info_cache().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cache.insert(
+        key,
+        SessionInfoCacheEntry {
+            size,
+            mtime,
+            info: std::sync::Arc::clone(&info),
+        },
+    );
+    Ok(info)
+}
+
+fn extract_text_from_content(item: &Value) -> Option<String> {
+    let content = item.get("content")?.as_array()?;
+    for c in content {
+        let ctype = c.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if ctype == "input_text" || ctype == "output_text" || ctype == "text" {
+            if let Some(text) = c.get("text").and_then(|t| t.as_str()) {
+                let truncated = match text.char_indices().nth(200) {
+                    Some((idx, _)) => format!("{}...", &text[..idx]),
+                    None => text.to_string(),
+                };
+                return Some(truncated);
+            }
+        }
+    }
+    None
+}
+
+/// Returns true when `text` is an auto-injected wrapper block prepended by
+/// codex CLI / Codex Desktop to every session (currently
+/// `<environment_context>...</environment_context>`). These look like user
+/// messages structurally but contain no real prompt, so they should be
+/// skipped when picking a session summary preview.
+fn is_codex_auto_injected_user_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("<environment_context>")
+}
+
+fn convert_codex_item(
+    item: &Value,
+    session_id: &str,
+    model: Option<&String>,
+    line_timestamp: &str,
+    counter: &mut u64,
+) -> Option<ClaudeMessage> {
+    let item_type = item.get("type").and_then(|t| t.as_str())?;
+    *counter += 1;
+
+    let uuid = item
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("codex-{counter}"));
+
+    let timestamp = item
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(line_timestamp)
+        .to_string();
+
+    match item_type {
+        "message" => {
+            let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content = convert_codex_content_array(item.get("content"));
+
+            Some(build_codex_message(
+                uuid,
+                session_id,
+                timestamp,
+                if role == "user" { "user" } else { "assistant" },
+                Some(role),
+                content,
+                if role == "assistant" {
+                    model.cloned()
+                } else {
+                    None
+                },
+            ))
+        }
+        "local_shell_call" => {
+            let command = item
+                .get("action")
+                .and_then(|a| a.get("command"))
+                .cloned()
+                .unwrap_or(Value::Null);
+
+            let command_str = if let Some(arr) = command.as_array() {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                command.as_str().unwrap_or("").to_string()
+            };
+
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let content = serde_json::json!([{
+                "type": "tool_use",
+                "id": call_id,
+                "name": "Bash",
+                "input": { "command": command_str }
+            }]);
+
+            Some(build_codex_message(
+                uuid,
+                session_id,
+                timestamp,
+                "assistant",
+                Some("assistant"),
+                Some(content),
+                model.cloned(),
+            ))
+        }
+        "function_call" => {
+            let raw_name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let name = map_codex_tool_name(raw_name);
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let arguments = item.get("arguments");
+            let mut input = parse_tool_arguments(arguments);
+            normalize_tool_input(name, &mut input);
+
+            let content = serde_json::json!([{
+                "type": "tool_use",
+                "id": call_id,
+                "name": name,
+                "input": input
+            }]);
+
+            Some(build_codex_message(
+                uuid,
+                session_id,
+                timestamp,
+                "assistant",
+                Some("assistant"),
+                Some(content),
+                model.cloned(),
+            ))
+        }
+        "function_call_output" => {
+            let output = item.get("output").cloned().unwrap_or(Value::Null);
+            let output = normalize_tool_output(output);
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let content = serde_json::json!([{
+                "type": "tool_result",
+                "tool_use_id": call_id,
+                "content": output
+            }]);
+
+            Some(build_codex_message(
+                uuid,
+                session_id,
+                timestamp,
+                "user",
+                Some("user"),
+                Some(content),
+                None,
+            ))
+        }
+        "custom_tool_call" => {
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("custom_tool");
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| uuid.clone());
+            let mut input = item.get("input").cloned().unwrap_or(Value::Null);
+            normalize_custom_tool_input(name, &mut input);
+
+            let content = serde_json::json!([{
+                "type": "tool_use",
+                "id": call_id,
+                "name": name,
+                "input": input
+            }]);
+
+            Some(build_codex_message(
+                uuid,
+                session_id,
+                timestamp,
+                "assistant",
+                Some("assistant"),
+                Some(content),
+                model.cloned(),
+            ))
+        }
+        "custom_tool_call_output" => {
+            let output = item.get("output").cloned().unwrap_or(Value::Null);
+            let output = normalize_tool_output(output);
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let content = serde_json::json!([{
+                "type": "tool_result",
+                "tool_use_id": call_id,
+                "content": output
+            }]);
+
+            Some(build_codex_message(
+                uuid,
+                session_id,
+                timestamp,
+                "user",
+                Some("user"),
+                Some(content),
+                None,
+            ))
+        }
+        "web_search_call" => {
+            let search_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| uuid.clone());
+            let action = item
+                .get("action")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::default()));
+            let input = normalize_web_search_input(action);
+
+            let content = serde_json::json!([{
+                "type": "tool_use",
+                "id": search_id,
+                "name": "WebSearch",
+                "input": input
+            }]);
+
+            Some(build_codex_message(
+                uuid,
+                session_id,
+                timestamp,
+                "assistant",
+                Some("assistant"),
+                Some(content),
+                model.cloned(),
+            ))
+        }
+        "reasoning" => {
+            let thinking_text = item
+                .get("summary")
+                .and_then(|s| s.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+
+            if thinking_text.is_empty() {
+                return None;
+            }
+
+            let content = serde_json::json!([{
+                "type": "thinking",
+                "thinking": thinking_text
+            }]);
+
+            Some(build_codex_message(
+                uuid,
+                session_id,
+                timestamp,
+                "assistant",
+                Some("assistant"),
+                Some(content),
+                model.cloned(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn convert_codex_event(
+    payload: &Value,
+    session_id: &str,
+    line_timestamp: &str,
+    counter: &mut u64,
+) -> Option<ClaudeMessage> {
+    let event_type = payload.get("type").and_then(|t| t.as_str())?;
+
+    match event_type {
+        "task_started" => {
+            *counter += 1;
+            let mut msg = build_codex_message(
+                format!("codex-event-{counter}"),
+                session_id,
+                line_timestamp.to_string(),
+                "progress",
+                None,
+                None,
+                None,
+            );
+            msg.data = Some(serde_json::json!({
+                "type": "waiting_for_task",
+                "status": "started",
+                "taskId": payload.get("turn_id").and_then(Value::as_str).unwrap_or_default(),
+                "message": "Task started"
+            }));
+            msg.tool_use_id = payload
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Some(msg)
+        }
+        "task_complete" => {
+            *counter += 1;
+            let mut msg = build_codex_message(
+                format!("codex-event-{counter}"),
+                session_id,
+                line_timestamp.to_string(),
+                "progress",
+                None,
+                None,
+                None,
+            );
+            msg.data = Some(serde_json::json!({
+                "type": "waiting_for_task",
+                "status": "completed",
+                "taskId": payload.get("turn_id").and_then(Value::as_str).unwrap_or_default(),
+                "message": "Task completed"
+            }));
+            msg.tool_use_id = payload
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Some(msg)
+        }
+        "context_compacted" => {
+            *counter += 1;
+            let mut msg = build_codex_message(
+                format!("codex-event-{counter}"),
+                session_id,
+                line_timestamp.to_string(),
+                "system",
+                None,
+                Some(serde_json::json!("Context compacted")),
+                None,
+            );
+            msg.subtype = Some("microcompact_boundary".to_string());
+            msg.level = Some("info".to_string());
+            msg.microcompact_metadata = Some(serde_json::json!({
+                "trigger": "context_compacted"
+            }));
+            Some(msg)
+        }
+        "agent_reasoning" => {
+            let text = payload.get("text").and_then(Value::as_str)?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            *counter += 1;
+            let content = serde_json::json!([{
+                "type": "thinking",
+                "thinking": text
+            }]);
+            Some(build_codex_message(
+                format!("codex-event-{counter}"),
+                session_id,
+                line_timestamp.to_string(),
+                "assistant",
+                Some("assistant"),
+                Some(content),
+                None,
+            ))
+        }
+        "turn_aborted" => {
+            *counter += 1;
+            let reason = payload
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let turn_id = payload.get("turn_id").and_then(Value::as_str).unwrap_or("");
+            let content = serde_json::json!([{
+                "type": "text",
+                "text": format!("[Turn Aborted] reason: {reason}, turn: {turn_id}")
+            }]);
+            let mut msg = build_codex_message(
+                format!("codex-abort-{counter}"),
+                session_id,
+                line_timestamp.to_string(),
+                "system",
+                None,
+                Some(content),
+                None,
+            );
+            msg.subtype = Some("turn_aborted".to_string());
+            msg.level = Some("warning".to_string());
+            Some(msg)
+        }
+        // Unsupported/duplicated Codex events are intentionally ignored.
+        _ => None,
+    }
+}
+
+fn convert_codex_compacted(
+    payload: &Value,
+    session_id: &str,
+    line_timestamp: &str,
+    counter: &mut u64,
+) -> ClaudeMessage {
+    *counter += 1;
+    let replacement_history_count = payload
+        .get("replacement_history")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+
+    let mut msg = build_codex_message(
+        format!("codex-compacted-{counter}"),
+        session_id,
+        line_timestamp.to_string(),
+        "system",
+        None,
+        Some(serde_json::json!("Conversation compacted")),
+        None,
+    );
+    msg.subtype = Some("compact_boundary".to_string());
+    msg.level = Some("info".to_string());
+    msg.compact_metadata = Some(serde_json::json!({
+        "trigger": "compacted",
+        "replacementHistoryCount": replacement_history_count
+    }));
+    msg
+}
+
+fn extract_token_totals(payload: &Value) -> Option<(u32, u32, u32)> {
+    // Recent Codex logs store usage in payload.info.total_token_usage.
+    let total = payload.get("info")?.get("total_token_usage")?;
+    let input = total.get("input_tokens")?.as_u64()? as u32;
+    let output = total.get("output_tokens")?.as_u64()? as u32;
+    let cached = total
+        .get("cached_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    Some((input, output, cached))
+}
+
+fn extract_last_token_usage(payload: &Value) -> Option<(u32, u32, u32)> {
+    // Fallback for older/newer variants that only include last token usage.
+    let last = payload.get("info")?.get("last_token_usage")?;
+    let input = last.get("input_tokens")?.as_u64()? as u32;
+    let output = last.get("output_tokens")?.as_u64()? as u32;
+    let cached = last
+        .get("cached_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    Some((input, output, cached))
+}
+
+fn map_codex_tool_name(name: &str) -> &str {
+    match name {
+        "exec_command" | "shell" | "write_stdin" => "Bash",
+        _ => name,
+    }
+}
+
+fn parse_tool_arguments(arguments: Option<&Value>) -> Value {
+    match arguments {
+        Some(Value::String(s)) => {
+            serde_json::from_str(s).unwrap_or_else(|_| Value::Object(serde_json::Map::default()))
+        }
+        Some(v) if v.is_object() || v.is_array() => v.clone(),
+        _ => Value::Object(serde_json::Map::default()),
+    }
+}
+
+fn normalize_tool_input(tool_name: &str, input: &mut Value) {
+    if tool_name != "Bash" {
+        return;
+    }
+
+    let Some(obj) = input.as_object_mut() else {
+        return;
+    };
+
+    // Codex exec_command uses "cmd"; UI Bash renderer expects "command".
+    if !obj.contains_key("command") {
+        if let Some(cmd) = obj.get("cmd").cloned() {
+            match cmd {
+                Value::String(_) => {
+                    obj.insert("command".to_string(), cmd);
+                }
+                Value::Array(arr) => {
+                    let joined = arr
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    obj.insert("command".to_string(), Value::String(joined));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(Value::Array(arr)) = obj.get("command").cloned() {
+        let joined = arr
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        obj.insert("command".to_string(), Value::String(joined));
+    }
+}
+
+fn normalize_custom_tool_input(tool_name: &str, input: &mut Value) {
+    if input.is_object() {
+        return;
+    }
+
+    if tool_name == "apply_patch" {
+        let patch = input.as_str().unwrap_or("").to_string();
+        *input = serde_json::json!({ "patch": patch });
+        return;
+    }
+
+    *input = serde_json::json!({ "input": input.clone() });
+}
+
+fn normalize_web_search_input(action: Value) -> Value {
+    let Some(action_obj) = action.as_object() else {
+        return Value::Object(serde_json::Map::default());
+    };
+
+    let mut input = serde_json::Map::default();
+    if let Some(query) = action_obj.get("query").and_then(Value::as_str) {
+        input.insert("query".to_string(), Value::String(query.to_string()));
+    } else if let Some(url) = action_obj.get("url").and_then(Value::as_str) {
+        input.insert("query".to_string(), Value::String(url.to_string()));
+    } else if let Some(pattern) = action_obj.get("pattern").and_then(Value::as_str) {
+        input.insert("query".to_string(), Value::String(pattern.to_string()));
+    }
+    if let Some(queries) = action_obj.get("queries").cloned() {
+        input.insert("queries".to_string(), queries);
+    }
+    if let Some(action_type) = action_obj.get("type").and_then(Value::as_str) {
+        input.insert(
+            "action_type".to_string(),
+            Value::String(action_type.to_string()),
+        );
+    }
+
+    Value::Object(input)
+}
+
+fn normalize_tool_output(output: Value) -> Value {
+    let Value::String(raw) = output else {
+        return output;
+    };
+
+    // exec_command tool output can be a JSON string: {"output":"...", ...}
+    if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
+        if let Some(inner_output) = parsed.get("output") {
+            return inner_output.clone();
+        }
+    }
+
+    // Codex function wrapper output usually embeds "Output:\n{actual stdout}".
+    if let Some((_, out)) = raw.split_once("\nOutput:\n") {
+        return Value::String(out.to_string());
+    }
+
+    Value::String(raw)
+}
+
+fn try_merge_tool_result_into_previous(
+    messages: &mut [ClaudeMessage],
+    msg: &ClaudeMessage,
+) -> bool {
+    if msg.message_type != "user" {
+        return false;
+    }
+
+    let Some((tool_use_id, tool_result_block)) = extract_tool_result_block(msg) else {
+        return false;
+    };
+
+    for prev in messages.iter_mut().rev() {
+        if prev.message_type != "assistant" {
+            continue;
+        }
+        if has_matching_tool_use(prev, &tool_use_id) {
+            append_content_block(prev, tool_result_block);
+            return true;
+        }
+    }
+
+    false
+}
+
+fn extract_tool_result_block(msg: &ClaudeMessage) -> Option<(String, Value)> {
+    let arr = msg.content.as_ref()?.as_array()?;
+    let first = arr.first()?;
+    if first.get("type").and_then(Value::as_str) != Some("tool_result") {
+        return None;
+    }
+    let tool_use_id = first
+        .get("tool_use_id")
+        .and_then(Value::as_str)?
+        .to_string();
+    Some((tool_use_id, first.clone()))
+}
+
+fn has_matching_tool_use(msg: &ClaudeMessage, tool_use_id: &str) -> bool {
+    let Some(arr) = msg.content.as_ref().and_then(Value::as_array) else {
+        return false;
+    };
+    arr.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("tool_use")
+            && item.get("id").and_then(Value::as_str) == Some(tool_use_id)
+    })
+}
+
+fn append_content_block(msg: &mut ClaudeMessage, block: Value) {
+    match &mut msg.content {
+        Some(Value::Array(arr)) => arr.push(block),
+        _ => msg.content = Some(Value::Array(vec![block])),
+    }
+}
+
+fn extract_first_tool_use(content: Option<&Value>) -> Option<Value> {
+    let arr = content?.as_array()?;
+    arr.iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .cloned()
+}
+
+fn convert_codex_content_array(content: Option<&Value>) -> Option<Value> {
+    let arr = content?.as_array()?;
+
+    let items: Vec<Value> = arr
+        .iter()
+        .filter_map(|item| {
+            let ctype = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match ctype {
+                "input_text" | "output_text" | "text" => {
+                    let text = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    Some(serde_json::json!({
+                        "type": "text",
+                        "text": text
+                    }))
+                }
+                "input_image" => {
+                    let image_url = item.get("image_url").and_then(Value::as_str).unwrap_or("");
+                    if image_url.is_empty() {
+                        return None;
+                    }
+                    Some(serde_json::json!({
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": image_url
+                        }
+                    }))
+                }
+                "refusal" => {
+                    let refusal = item
+                        .get("refusal")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("Refused");
+                    Some(serde_json::json!({
+                        "type": "text",
+                        "text": format!("[Refusal] {refusal}")
+                    }))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+
+    if items.is_empty() {
+        None
+    } else {
+        Some(Value::Array(items))
+    }
+}
+
+fn build_codex_message(
+    uuid: String,
+    session_id: &str,
+    timestamp: String,
+    message_type: &str,
+    role: Option<&str>,
+    content: Option<Value>,
+    model: Option<String>,
+) -> ClaudeMessage {
+    let tool_use = if message_type == "assistant" {
+        extract_first_tool_use(content.as_ref())
+    } else {
+        None
+    };
+
+    let mut msg = build_provider_message(
+        "codex",
+        uuid,
+        session_id,
+        timestamp,
+        message_type,
+        role,
+        content,
+        model,
+    );
+    msg.tool_use = tool_use;
+    msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use serial_test::serial;
+    use std::ffi::OsString;
+    use std::fs;
+    use tempfile::TempDir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.original.as_ref() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn write_codex_rollout(
+        sessions_dir: &Path,
+        filename: &str,
+        session_id: &str,
+        cwd: &str,
+        first_prompt: &str,
+    ) -> PathBuf {
+        let rollout_path = sessions_dir.join(filename);
+        let lines = [
+            json!({
+                "type": "session_meta",
+                "payload": { "id": session_id, "cwd": cwd }
+            }),
+            json!({
+                "timestamp": "2026-02-21T10:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "created_at": "2026-02-21T10:00:00Z",
+                    "content": [{ "type": "input_text", "text": first_prompt }]
+                }
+            }),
+        ];
+        let content = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{content}\n"))
+            .expect("rollout fixture should be written");
+        rollout_path
+    }
+
+    fn create_codex_state_db(codex_home: &Path, rows: &[(&str, &str, &str)]) {
+        let conn = Connection::open(codex_home.join(STATE_DB_FILENAME))
+            .expect("codex state db should be created");
+        conn.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                first_user_message TEXT NOT NULL
+            )",
+            [],
+        )
+        .expect("threads table should be created");
+
+        for (id, title, first_user_message) in rows {
+            conn.execute(
+                "INSERT INTO threads (id, title, first_user_message) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, title, first_user_message],
+            )
+            .expect("thread row should be inserted");
+        }
+    }
+
+    #[test]
+    fn map_exec_command_to_bash() {
+        assert_eq!(map_codex_tool_name("exec_command"), "Bash");
+        assert_eq!(map_codex_tool_name("shell"), "Bash");
+        assert_eq!(map_codex_tool_name("write_stdin"), "Bash");
+        assert_eq!(map_codex_tool_name("batch_execute"), "batch_execute");
+    }
+
+    #[test]
+    fn normalize_bash_input_maps_cmd_to_command() {
+        let mut input = json!({ "cmd": "pwd && ls -la" });
+        normalize_tool_input("Bash", &mut input);
+        assert_eq!(
+            input.get("command").and_then(Value::as_str),
+            Some("pwd && ls -la")
+        );
+    }
+
+    #[test]
+    fn normalize_bash_input_maps_command_array_to_string() {
+        let mut input = json!({ "command": ["bash", "-lc", "pwd"] });
+        normalize_tool_input("Bash", &mut input);
+        assert_eq!(
+            input.get("command").and_then(Value::as_str),
+            Some("bash -lc pwd")
+        );
+    }
+
+    #[test]
+    fn normalize_tool_output_extracts_wrapped_output() {
+        let wrapped = "Chunk ID: abc\nWall time: 0.01 seconds\nOutput:\nhello\nworld";
+        let out = normalize_tool_output(Value::String(wrapped.to_string()));
+        assert_eq!(out.as_str(), Some("hello\nworld"));
+    }
+
+    #[test]
+    fn normalize_tool_output_extracts_json_output_field() {
+        let out = normalize_tool_output(Value::String(
+            r#"{"output":"done","metadata":{"exit_code":0}}"#.to_string(),
+        ));
+        assert_eq!(out.as_str(), Some("done"));
+    }
+
+    #[test]
+    fn parse_nested_token_count_totals() {
+        let payload = json!({
+            "type": "token_count",
+            "info": {
+                "total_token_usage": {
+                    "input_tokens": 120,
+                    "output_tokens": 30
+                }
+            }
+        });
+        assert_eq!(extract_token_totals(&payload), Some((120, 30, 0)));
+    }
+
+    #[test]
+    fn normalize_custom_tool_input_wraps_apply_patch_text() {
+        let mut input = Value::String("*** Begin Patch".to_string());
+        normalize_custom_tool_input("apply_patch", &mut input);
+        assert_eq!(
+            input.get("patch").and_then(Value::as_str),
+            Some("*** Begin Patch")
+        );
+    }
+
+    #[test]
+    fn normalize_web_search_input_extracts_query_and_type() {
+        let input = normalize_web_search_input(json!({
+            "type": "search",
+            "query": "codex parser",
+            "queries": ["codex parser", "codex rollout"]
+        }));
+        assert_eq!(
+            input.get("query").and_then(Value::as_str),
+            Some("codex parser")
+        );
+        assert_eq!(
+            input.get("action_type").and_then(Value::as_str),
+            Some("search")
+        );
+        assert!(input.get("queries").is_some());
+    }
+
+    #[test]
+    fn convert_content_array_maps_input_image_to_image() {
+        let converted = convert_codex_content_array(Some(&json!([
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,abc"
+            }
+        ])))
+        .expect("content should be converted");
+
+        let arr = converted
+            .as_array()
+            .expect("converted content should be an array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].get("type").and_then(Value::as_str), Some("image"));
+        assert_eq!(
+            arr[0]
+                .get("source")
+                .and_then(|v| v.get("url"))
+                .and_then(Value::as_str),
+            Some("data:image/png;base64,abc")
+        );
+    }
+
+    #[test]
+    fn convert_custom_tool_call_to_tool_use() {
+        let mut counter = 0u64;
+        let msg = convert_codex_item(
+            &json!({
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "call_id": "call_patch_1",
+                "input": "*** Begin Patch"
+            }),
+            "session-1",
+            None,
+            "2026-02-19T12:00:00Z",
+            &mut counter,
+        )
+        .expect("custom_tool_call should be converted");
+
+        assert_eq!(msg.message_type, "assistant");
+        let arr = msg
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .expect("content should be an array");
+        assert_eq!(arr[0].get("type").and_then(Value::as_str), Some("tool_use"));
+        assert_eq!(
+            arr[0].get("name").and_then(Value::as_str),
+            Some("apply_patch")
+        );
+        assert_eq!(
+            arr[0]
+                .get("input")
+                .and_then(|v| v.get("patch"))
+                .and_then(Value::as_str),
+            Some("*** Begin Patch")
+        );
+    }
+
+    #[test]
+    fn convert_parallel_agent_function_calls_preserves_protocol_fields() {
+        let fixtures = [
+            (
+                json!({
+                    "type": "function_call",
+                    "name": "spawn_agent",
+                    "call_id": "call_spawn_1",
+                    "arguments": "{\"message\":\"Check the API\"}"
+                }),
+                "spawn_agent",
+            ),
+            (
+                json!({
+                    "type": "function_call",
+                    "name": "wait_agent",
+                    "call_id": "call_wait_1",
+                    "arguments": "{\"targets\":[\"agent-1\",\"agent-2\"]}"
+                }),
+                "wait_agent",
+            ),
+        ];
+        let mut counter = 0u64;
+
+        for (item, expected_name) in fixtures {
+            let msg = convert_codex_item(
+                &item,
+                "session-1",
+                None,
+                "2026-07-07T00:00:00Z",
+                &mut counter,
+            )
+            .expect("collaboration function call should be converted");
+            let block = msg
+                .content
+                .as_ref()
+                .and_then(Value::as_array)
+                .and_then(|blocks| blocks.first())
+                .expect("tool use block should exist");
+
+            assert_eq!(block["type"], "tool_use");
+            assert_eq!(block["name"], expected_name);
+            assert!(block["input"].is_object());
+        }
+    }
+
+    #[test]
+    fn convert_custom_tool_call_output_to_tool_result() {
+        let mut counter = 0u64;
+        let msg = convert_codex_item(
+            &json!({
+                "type": "custom_tool_call_output",
+                "call_id": "call_patch_1",
+                "output": "{\"output\":\"Success. Updated files\",\"metadata\":{\"exit_code\":0}}"
+            }),
+            "session-1",
+            None,
+            "2026-02-19T12:00:01Z",
+            &mut counter,
+        )
+        .expect("custom_tool_call_output should be converted");
+
+        assert_eq!(msg.message_type, "user");
+        let arr = msg
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .expect("content should be an array");
+        assert_eq!(
+            arr[0].get("type").and_then(Value::as_str),
+            Some("tool_result")
+        );
+        assert_eq!(
+            arr[0].get("tool_use_id").and_then(Value::as_str),
+            Some("call_patch_1")
+        );
+        assert_eq!(
+            arr[0].get("content").and_then(Value::as_str),
+            Some("Success. Updated files")
+        );
+    }
+
+    #[test]
+    fn convert_web_search_call_to_web_search_tool_use() {
+        let mut counter = 0u64;
+        let msg = convert_codex_item(
+            &json!({
+                "type": "web_search_call",
+                "action": {
+                    "type": "open_page",
+                    "url": "https://example.com"
+                }
+            }),
+            "session-1",
+            None,
+            "2026-02-19T12:00:02Z",
+            &mut counter,
+        )
+        .expect("web_search_call should be converted");
+
+        assert_eq!(msg.message_type, "assistant");
+        let arr = msg
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .expect("content should be an array");
+        assert_eq!(arr[0].get("type").and_then(Value::as_str), Some("tool_use"));
+        assert_eq!(
+            arr[0].get("name").and_then(Value::as_str),
+            Some("WebSearch")
+        );
+        assert_eq!(
+            arr[0]
+                .get("input")
+                .and_then(|v| v.get("query"))
+                .and_then(Value::as_str),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn merge_tool_result_into_previous_tool_use_message() {
+        let mut messages = vec![build_codex_message(
+            "assistant-1".to_string(),
+            "session-1",
+            "2026-02-19T12:00:00Z".to_string(),
+            "assistant",
+            Some("assistant"),
+            Some(json!([{
+                "type": "tool_use",
+                "id": "call_abc",
+                "name": "Bash",
+                "input": { "command": "pwd" }
+            }])),
+            None,
+        )];
+
+        let result_msg = build_codex_message(
+            "user-1".to_string(),
+            "session-1",
+            "2026-02-19T12:00:01Z".to_string(),
+            "user",
+            Some("user"),
+            Some(json!([{
+                "type": "tool_result",
+                "tool_use_id": "call_abc",
+                "content": "ok"
+            }])),
+            None,
+        );
+
+        assert!(try_merge_tool_result_into_previous(
+            &mut messages,
+            &result_msg
+        ));
+        let merged_arr = messages[0]
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .expect("assistant message content should be an array");
+        assert_eq!(merged_arr.len(), 2);
+        assert_eq!(
+            merged_arr[1].get("type").and_then(Value::as_str),
+            Some("tool_result")
+        );
+    }
+
+    #[test]
+    fn build_codex_message_sets_tool_use_from_content() {
+        let msg = build_codex_message(
+            "assistant-1".to_string(),
+            "session-1",
+            "2026-02-19T12:00:00Z".to_string(),
+            "assistant",
+            Some("assistant"),
+            Some(json!([{
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "Bash",
+                "input": {"command": "pwd"}
+            }])),
+            None,
+        );
+
+        assert!(msg.tool_use.is_some());
+        assert_eq!(
+            msg.tool_use
+                .as_ref()
+                .and_then(|v| v.get("name"))
+                .and_then(Value::as_str),
+            Some("Bash")
+        );
+    }
+
+    #[test]
+    fn convert_task_started_event_to_progress_message() {
+        let mut counter = 0u64;
+        let msg = convert_codex_event(
+            &json!({
+                "type": "task_started",
+                "turn_id": "turn_1"
+            }),
+            "session-1",
+            "2026-02-19T12:00:00Z",
+            &mut counter,
+        )
+        .expect("task_started should be converted");
+
+        assert_eq!(msg.message_type, "progress");
+        assert_eq!(
+            msg.data
+                .as_ref()
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_str),
+            Some("started")
+        );
+    }
+
+    #[test]
+    fn convert_context_compacted_event_to_system_message() {
+        let mut counter = 0u64;
+        let msg = convert_codex_event(
+            &json!({
+                "type": "context_compacted"
+            }),
+            "session-1",
+            "2026-02-19T12:00:00Z",
+            &mut counter,
+        )
+        .expect("context_compacted should be converted");
+
+        assert_eq!(msg.message_type, "system");
+        assert_eq!(msg.subtype.as_deref(), Some("microcompact_boundary"));
+    }
+
+    #[test]
+    fn convert_agent_reasoning_event_to_thinking_message() {
+        let mut counter = 0u64;
+        let msg = convert_codex_event(
+            &json!({
+                "type": "agent_reasoning",
+                "text": "**Inspecting parsers**"
+            }),
+            "session-1",
+            "2026-02-19T12:00:00Z",
+            &mut counter,
+        )
+        .expect("agent_reasoning should be converted");
+
+        assert_eq!(msg.message_type, "assistant");
+        let arr = msg
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .expect("content should be an array");
+        assert_eq!(arr[0].get("type").and_then(Value::as_str), Some("thinking"));
+        assert_eq!(
+            arr[0].get("thinking").and_then(Value::as_str),
+            Some("**Inspecting parsers**")
+        );
+    }
+
+    #[test]
+    fn convert_agent_reasoning_event_skips_empty_text() {
+        let mut counter = 0u64;
+        let msg = convert_codex_event(
+            &json!({
+                "type": "agent_reasoning",
+                "text": "   "
+            }),
+            "session-1",
+            "2026-02-19T12:00:00Z",
+            &mut counter,
+        );
+
+        assert!(msg.is_none());
+        assert_eq!(counter, 0);
+    }
+
+    #[test]
+    fn convert_agent_message_event_not_handled() {
+        // agent_message events are skipped in load_messages() to avoid
+        // duplicating response_item messages. convert_codex_event should
+        // return None for them.
+        let mut counter = 0u64;
+        let msg = convert_codex_event(
+            &json!({
+                "type": "agent_message",
+                "message": "Working on requested changes"
+            }),
+            "session-1",
+            "2026-02-19T12:00:00Z",
+            &mut counter,
+        );
+        assert!(msg.is_none());
+    }
+
+    #[test]
+    fn convert_user_message_event_not_handled() {
+        // user_message events are skipped in load_messages() to avoid
+        // duplicating response_item messages. convert_codex_event should
+        // return None for them.
+        let mut counter = 0u64;
+        let msg = convert_codex_event(
+            &json!({
+                "type": "user_message",
+                "message": "Please patch this file"
+            }),
+            "session-1",
+            "2026-02-19T12:00:00Z",
+            &mut counter,
+        );
+        assert!(msg.is_none());
+    }
+
+    #[test]
+    fn convert_compacted_line_to_system_message() {
+        let mut counter = 0u64;
+        let msg = convert_codex_compacted(
+            &json!({
+                "message": "",
+                "replacement_history": [{"type":"message"}]
+            }),
+            "session-1",
+            "2026-02-19T12:00:00Z",
+            &mut counter,
+        );
+
+        assert_eq!(msg.message_type, "system");
+        assert_eq!(msg.subtype.as_deref(), Some("compact_boundary"));
+        assert_eq!(
+            msg.compact_metadata
+                .as_ref()
+                .and_then(|v| v.get("replacementHistoryCount"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn load_messages_parses_codex_rollout_end_to_end() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout_path = sessions_dir.join("rollout-2026-02-19.jsonl");
+
+        let lines = vec![
+            json!({
+                "timestamp": "2026-02-19T12:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "sess-1" }
+            }),
+            json!({
+                "timestamp": "2026-02-19T12:00:01Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-5-codex" }
+            }),
+            json!({
+                "timestamp": "2026-02-19T12:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "item-1",
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_1",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                }
+            }),
+            json!({
+                "timestamp": "2026-02-19T12:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "item-2",
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "{\"output\":\"/tmp\",\"metadata\":{\"exit_code\":0}}"
+                }
+            }),
+            json!({
+                "timestamp": "2026-02-19T12:00:04Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "item-3",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "done" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-02-19T12:00:05Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 20
+                        }
+                    }
+                }
+            }),
+            json!({
+                "timestamp": "2026-02-19T12:00:06Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn_1"
+                }
+            }),
+            json!({
+                "timestamp": "2026-02-19T12:00:07Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn_1"
+                }
+            }),
+            json!({
+                "timestamp": "2026-02-19T12:00:08Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "context_compacted"
+                }
+            }),
+            json!({
+                "timestamp": "2026-02-19T12:00:09Z",
+                "type": "compacted",
+                "payload": {
+                    "replacement_history": [{ "type": "message" }, { "type": "summary" }]
+                }
+            }),
+        ];
+
+        let content = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{content}\n")).expect("fixture should be written");
+
+        let messages = load_messages(
+            rollout_path
+                .to_str()
+                .expect("rollout path should be valid UTF-8"),
+        )
+        .expect("rollout should be parsed");
+
+        assert_eq!(messages.len(), 6);
+        assert_eq!(messages[0].message_type, "assistant");
+        assert_eq!(messages[1].message_type, "assistant");
+        assert_eq!(messages[2].message_type, "progress");
+        assert_eq!(messages[3].message_type, "progress");
+        assert_eq!(messages[4].message_type, "system");
+        assert_eq!(messages[5].message_type, "system");
+
+        let first_blocks = messages[0]
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .expect("first message content should be an array");
+        assert_eq!(first_blocks.len(), 2);
+        assert_eq!(
+            first_blocks[0].get("type").and_then(Value::as_str),
+            Some("tool_use")
+        );
+        assert_eq!(
+            first_blocks[1].get("type").and_then(Value::as_str),
+            Some("tool_result")
+        );
+        assert_eq!(
+            first_blocks[1].get("content").and_then(Value::as_str),
+            Some("/tmp")
+        );
+
+        assert_eq!(
+            messages[0]
+                .tool_use
+                .as_ref()
+                .and_then(|v| v.get("name"))
+                .and_then(Value::as_str),
+            Some("Bash")
+        );
+        assert_eq!(messages[0].model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(messages[1].model.as_deref(), Some("gpt-5-codex"));
+
+        assert_eq!(
+            messages[1].usage.as_ref().and_then(|u| u.input_tokens),
+            Some(100)
+        );
+        assert_eq!(
+            messages[1].usage.as_ref().and_then(|u| u.output_tokens),
+            Some(20)
+        );
+
+        assert_eq!(
+            messages[2]
+                .data
+                .as_ref()
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_str),
+            Some("started")
+        );
+        assert_eq!(
+            messages[3]
+                .data
+                .as_ref()
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_str),
+            Some("completed")
+        );
+        assert_eq!(
+            messages[4].subtype.as_deref(),
+            Some("microcompact_boundary")
+        );
+        assert_eq!(messages[5].subtype.as_deref(), Some("compact_boundary"));
+        assert_eq!(
+            messages[5]
+                .compact_metadata
+                .as_ref()
+                .and_then(|v| v.get("replacementHistoryCount"))
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+
+        assert!(messages
+            .iter()
+            .all(|m| m.provider.as_deref() == Some("codex")));
+        assert!(messages.iter().all(|m| m.session_id == "sess-1"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_messages_skips_duplicate_event_msg_for_user_and_agent() {
+        // Codex logs user/assistant text in both response_item (type=message)
+        // and event_msg (type=user_message / agent_message). Only the
+        // response_item version should be kept.
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout_path = sessions_dir.join("rollout-dedup-test.jsonl");
+
+        let lines = [
+            json!({
+                "timestamp": "2026-03-01T10:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "sess-dedup" }
+            }),
+            // User message via response_item (canonical)
+            json!({
+                "timestamp": "2026-03-01T10:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "item-u1",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "hello" }]
+                }
+            }),
+            // Duplicate user message via event_msg (should be skipped)
+            json!({
+                "timestamp": "2026-03-01T10:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "hello"
+                }
+            }),
+            // Assistant message via response_item (canonical)
+            json!({
+                "timestamp": "2026-03-01T10:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "item-a1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "hi there" }]
+                }
+            }),
+            // Duplicate assistant message via event_msg (should be skipped)
+            json!({
+                "timestamp": "2026-03-01T10:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "hi there"
+                }
+            }),
+            // Non-duplicate event (token_count) should still be processed
+            json!({
+                "timestamp": "2026-03-01T10:00:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 50,
+                            "output_tokens": 10
+                        }
+                    }
+                }
+            }),
+        ];
+
+        let content = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{content}\n")).expect("fixture should be written");
+
+        let messages = load_messages(
+            rollout_path
+                .to_str()
+                .expect("rollout path should be valid UTF-8"),
+        )
+        .expect("rollout should be parsed");
+
+        // Only 2 messages: 1 user + 1 assistant (no duplicates from event_msg)
+        // Before this fix, there were 4 messages (each duplicated by event_msg).
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].message_type, "user");
+        assert_eq!(messages[1].message_type, "assistant");
+
+        // Verify content is correct
+        let user_text = messages[0]
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|arr| arr[0].get("text"))
+            .and_then(Value::as_str);
+        assert_eq!(user_text, Some("hello"));
+
+        let assistant_text = messages[1]
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|arr| arr[0].get("text"))
+            .and_then(Value::as_str);
+        assert_eq!(assistant_text, Some("hi there"));
+
+        // token_count event should still be applied to assistant message
+        assert_eq!(
+            messages[1].usage.as_ref().and_then(|u| u.input_tokens),
+            Some(50)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn load_messages_dedup_multi_turn_conversation() {
+        // Simulates a realistic multi-turn Codex conversation where each
+        // user/assistant message appears as both response_item and event_msg.
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout_path = sessions_dir.join("rollout-multiturn.jsonl");
+
+        let lines = [
+            json!({
+                "timestamp": "2026-03-01T10:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "sess-multi" }
+            }),
+            // Turn 1: user
+            json!({
+                "timestamp": "2026-03-01T10:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "u1", "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "first question" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-03-01T10:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "first question" }
+            }),
+            // Turn 1: assistant
+            json!({
+                "timestamp": "2026-03-01T10:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "a1", "type": "message", "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "first answer" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-03-01T10:00:02Z",
+                "type": "event_msg",
+                "payload": { "type": "agent_message", "message": "first answer" }
+            }),
+            // Turn 2: user
+            json!({
+                "timestamp": "2026-03-01T10:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "u2", "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "follow-up" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-03-01T10:00:03Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "follow-up" }
+            }),
+            // Turn 2: assistant
+            json!({
+                "timestamp": "2026-03-01T10:00:04Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "a2", "type": "message", "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "second answer" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-03-01T10:00:04Z",
+                "type": "event_msg",
+                "payload": { "type": "agent_message", "message": "second answer" }
+            }),
+            // Turn 3: user (final, no assistant reply yet)
+            json!({
+                "timestamp": "2026-03-01T10:00:05Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "u3", "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "one more thing" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-03-01T10:00:05Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "one more thing" }
+            }),
+        ];
+
+        let content = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{content}\n")).expect("fixture should be written");
+
+        let messages = load_messages(
+            rollout_path
+                .to_str()
+                .expect("rollout path should be valid UTF-8"),
+        )
+        .expect("rollout should be parsed");
+
+        // 5 messages: user, assistant, user, assistant, user (no duplicates)
+        // Without the fix this would be 10 messages.
+        assert_eq!(messages.len(), 5);
+
+        let expected = [
+            ("user", "first question"),
+            ("assistant", "first answer"),
+            ("user", "follow-up"),
+            ("assistant", "second answer"),
+            ("user", "one more thing"),
+        ];
+        for (i, (msg_type, text)) in expected.iter().enumerate() {
+            assert_eq!(messages[i].message_type, *msg_type, "message {i} type");
+            let actual_text = messages[i]
+                .content
+                .as_ref()
+                .and_then(Value::as_array)
+                .and_then(|arr| arr[0].get("text"))
+                .and_then(Value::as_str);
+            assert_eq!(actual_text, Some(*text), "message {i} content");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn load_sessions_includes_archived_sessions() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("21");
+        let archived_dir = codex_home.join("archived_sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        fs::create_dir_all(&archived_dir).expect("archived dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+
+        let project_cwd = "/Users/jack/client/claude-code-history-viewer";
+        let active_rollout = sessions_dir.join("rollout-active.jsonl");
+        let archived_rollout = archived_dir.join("rollout-archived.jsonl");
+        let active_lines = [
+            json!({
+                "type": "session_meta",
+                "payload": { "id": "active-session", "cwd": project_cwd }
+            }),
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "created_at": "2026-02-21T10:00:00Z",
+                    "content": [{ "type": "input_text", "text": "active" }]
+                }
+            }),
+        ];
+        let archived_lines = [
+            json!({
+                "type": "session_meta",
+                "payload": { "id": "archived-session", "cwd": project_cwd }
+            }),
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "created_at": "2026-02-21T11:00:00Z",
+                    "content": [{ "type": "input_text", "text": "archived" }]
+                }
+            }),
+        ];
+        let active_content = active_lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let archived_content = archived_lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&active_rollout, format!("{active_content}\n"))
+            .expect("active fixture should be written");
+        fs::write(&archived_rollout, format!("{archived_content}\n"))
+            .expect("archived fixture should be written");
+
+        let sessions = load_sessions(&format!("codex://{project_cwd}"), false)
+            .expect("sessions should be loaded");
+
+        assert_eq!(sessions.len(), 2);
+        // file_path carries native separators (backslashes on Windows), so
+        // normalize before checking for the forward-slash-delimited segment.
+        assert!(sessions
+            .iter()
+            .any(|s| s.file_path.replace('\\', "/").contains("/sessions/")));
+        assert!(sessions
+            .iter()
+            .any(|s| s.file_path.replace('\\', "/").contains("/archived_sessions/")));
+    }
+
+    #[test]
+    #[serial]
+    fn missing_cwd_sessions_load_from_unknown_project() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("21");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+
+        let rollout_path = sessions_dir.join("rollout-no-cwd.jsonl");
+        let lines = [
+            json!({
+                "type": "session_meta",
+                "payload": { "id": "no-cwd-session" }
+            }),
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "created_at": "2026-02-21T10:00:00Z",
+                    "content": [{ "type": "input_text", "text": "missing cwd" }]
+                }
+            }),
+        ];
+        let content = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{content}\n")).expect("fixture should be written");
+
+        let projects = scan_projects_from_path(
+            codex_home
+                .to_str()
+                .expect("codex home path should be valid UTF-8"),
+        )
+        .expect("projects should be scanned");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path, "codex://unknown");
+
+        let sessions = load_sessions("codex://unknown", false).expect("sessions should be loaded");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].actual_session_id, "no-cwd-session");
+    }
+
+    #[test]
+    #[serial]
+    fn load_sessions_uses_codex_native_title_from_state_db() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("21");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+
+        let project_cwd = "/Users/jack/client/claude-code-history-viewer";
+        write_codex_rollout(
+            &sessions_dir,
+            "rollout-native-title.jsonl",
+            "native-title-session",
+            project_cwd,
+            "Original first prompt",
+        );
+        create_codex_state_db(
+            &codex_home,
+            &[(
+                "native-title-session",
+                "Pinned Codex title",
+                "Original first prompt",
+            )],
+        );
+
+        let sessions = load_sessions(&format!("codex://{project_cwd}"), false)
+            .expect("sessions should be loaded");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].summary.as_deref(), Some("Pinned Codex title"));
+        assert!(sessions[0].is_renamed);
+    }
+
+    #[test]
+    #[serial]
+    fn load_messages_accepts_archived_session_path() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let archived_dir = codex_home.join("archived_sessions");
+        fs::create_dir_all(&archived_dir).expect("archived dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout_path = archived_dir.join("rollout-archived-only.jsonl");
+        let lines = [
+            json!({
+                "type": "session_meta",
+                "payload": { "id": "archived-session", "cwd": "/tmp/project" }
+            }),
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "id": "item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "created_at": "2026-02-21T10:00:00Z",
+                    "content": [{ "type": "output_text", "text": "ok" }]
+                }
+            }),
+        ];
+        let content = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{content}\n")).expect("fixture should be written");
+
+        let messages = load_messages(
+            rollout_path
+                .to_str()
+                .expect("rollout path should be valid UTF-8"),
+        )
+        .expect("archived rollout should be parsed");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "archived-session");
+    }
+
+    /// Helper: write `lines` as one JSON-per-line into a fresh rollout file
+    /// and run `extract_session_info` against it. Returns the resulting
+    /// `SessionInfo`. Used by the env-context-skip tests below.
+    fn run_extract_session_info_on_lines(lines: Vec<Value>) -> SessionInfo {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("rollout-2026-05-13.jsonl");
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{body}\n")).expect("rollout fixture should be written");
+        extract_session_info(&rollout_path).expect("extract_session_info should succeed")
+    }
+
+    fn run_extract_project_scan_info_on_lines(lines: Vec<Value>) -> ProjectScanInfo {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("rollout-2026-05-13.jsonl");
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{body}\n")).expect("rollout fixture should be written");
+        extract_project_scan_info(&rollout_path).expect("extract_project_scan_info should succeed")
+    }
+
+    fn session_meta_line() -> Value {
+        json!({
+            "timestamp": "2026-05-13T08:00:00Z",
+            "type": "session_meta",
+            "payload": { "id": "sess-env-ctx", "cwd": "/tmp/proj" }
+        })
+    }
+
+    fn user_message_line(timestamp: &str, text: &str) -> Value {
+        json!({
+            "timestamp": timestamp,
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": text }]
+            }
+        })
+    }
+
+    const ENV_CONTEXT_BLOCK: &str = "<environment_context>\n  <cwd>/tmp/proj</cwd>\n  <shell>powershell</shell>\n  <current_date>2026-05-13</current_date>\n  <timezone>Asia/Shanghai</timezone>\n</environment_context>";
+
+    #[test]
+    fn project_scan_info_uses_lightweight_metadata() {
+        let info = run_extract_project_scan_info_on_lines(vec![
+            session_meta_line(),
+            json!({
+                "timestamp": "2026-05-13T08:00:01Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "duplicate event" }
+            }),
+            json!({
+                "timestamp": "2026-05-13T08:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "hello" }]
+                }
+            }),
+            json!({
+                "timestamp": "2026-05-13T08:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{}"
+                }
+            }),
+            json!({
+                "timestamp": "2026-05-13T08:00:04Z",
+                "type": "response_item",
+                "payload": { "type": "reasoning", "summary": [] }
+            }),
+            json!({
+                "timestamp": "2026-05-13T08:00:05Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "done"
+                }
+            }),
+        ]);
+
+        assert_eq!(info.cwd.as_deref(), Some("/tmp/proj"));
+        assert!(info.message_count > 0);
+        assert!(!info.last_modified.is_empty());
+    }
+
+    #[test]
+    fn json_field_matcher_accepts_whitespace_around_colon() {
+        let line = br#"{ "type" : "response_item", "payload": { "type" : "message" } }"#;
+
+        assert!(has_json_string_field_value(
+            line,
+            JSON_TYPE_KEY,
+            b"response_item"
+        ));
+        assert!(has_json_string_field_value(line, JSON_TYPE_KEY, b"message"));
+    }
+
+    #[test]
+    /// First user message is an auto-injected `<environment_context>` block;
+    /// second user message is a real prompt — the summary should be the
+    /// real prompt, not the env-context block.
+    fn extract_session_info_skips_environment_context_wrapper() {
+        let info = run_extract_session_info_on_lines(vec![
+            session_meta_line(),
+            user_message_line("2026-05-13T08:00:01Z", ENV_CONTEXT_BLOCK),
+            user_message_line(
+                "2026-05-13T08:00:02Z",
+                "Please review my PR for the Antigravity provider.",
+            ),
+        ]);
+
+        assert_eq!(
+            info.summary.as_deref(),
+            Some("Please review my PR for the Antigravity provider.")
+        );
+        // message_count counts *every* response_item type=message,
+        // including the skipped wrapper, so the count surfaces real
+        // activity volume.
+        assert_eq!(info.message_count, 2);
+    }
+
+    #[test]
+    /// First user message is a real prompt — extractor must not regress
+    /// pre-existing behaviour for sessions without an env-context wrapper.
+    fn extract_session_info_uses_first_real_user_prompt() {
+        let info = run_extract_session_info_on_lines(vec![
+            session_meta_line(),
+            user_message_line("2026-05-13T08:00:01Z", "fix the WSL crash"),
+            user_message_line("2026-05-13T08:00:02Z", "second message"),
+        ]);
+
+        assert_eq!(info.summary.as_deref(), Some("fix the WSL crash"));
+        assert_eq!(info.message_count, 2);
+    }
+
+    #[test]
+    /// Session contains only auto-injected wrapper messages and no real
+    /// prompt — summary stays None, matching legacy empty-session behaviour.
+    fn extract_session_info_env_context_only_yields_no_summary() {
+        let info = run_extract_session_info_on_lines(vec![
+            session_meta_line(),
+            user_message_line("2026-05-13T08:00:01Z", ENV_CONTEXT_BLOCK),
+        ]);
+
+        assert!(
+            info.summary.is_none(),
+            "env-context-only sessions should not produce a misleading summary; got {:?}",
+            info.summary
+        );
+        // The wrapper still counts as a message — only the summary is gated.
+        assert_eq!(info.message_count, 1);
+    }
+
+    fn session_meta_line_with(timestamp: &str, id: &str, cwd: &str) -> Value {
+        json!({
+            "timestamp": timestamp,
+            "type": "session_meta",
+            "payload": { "id": id, "cwd": cwd }
+        })
+    }
+
+    #[test]
+    /// `codex fork` creates the new rollout with its own `session_meta` first,
+    /// then replays the source rollout verbatim — including the source's
+    /// `session_meta` line. The first meta is the file's identity; later metas
+    /// are replayed history and must not override it (issue #451: forked
+    /// sessions vanished because the session filter used the last meta's cwd
+    /// while project scanning used the first).
+    fn extract_session_info_keeps_first_session_meta_on_forked_rollout() {
+        let info = run_extract_session_info_on_lines(vec![
+            session_meta_line_with("2026-05-13T08:00:00Z", "sess-fork-new", "/tmp/proj-b"),
+            session_meta_line_with("2026-05-12T08:00:00Z", "sess-orig", "/tmp/proj-a"),
+            user_message_line("2026-05-13T08:00:01Z", "continue from the forked session"),
+        ]);
+
+        assert_eq!(info.session_id, "sess-fork-new");
+        assert_eq!(info.cwd.as_deref(), Some("/tmp/proj-b"));
+    }
+
+    #[test]
+    /// Messages replayed after the source's `session_meta` line in a forked
+    /// rollout must carry the forked file's own session id, not the source's.
+    fn parse_rollout_file_keeps_first_session_meta_id_on_forked_rollout() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("rollout-2026-05-13.jsonl");
+        let lines = [
+            session_meta_line_with("2026-05-13T08:00:00Z", "sess-fork-new", "/tmp/proj-b"),
+            session_meta_line_with("2026-05-12T08:00:00Z", "sess-orig", "/tmp/proj-a"),
+            user_message_line("2026-05-13T08:00:01Z", "continue from the forked session"),
+        ];
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{body}\n")).expect("rollout fixture should be written");
+
+        let messages =
+            parse_rollout_file(&rollout_path).expect("parse_rollout_file should succeed");
+
+        assert!(!messages.is_empty());
+        assert!(
+            messages.iter().all(|m| m.session_id == "sess-fork-new"),
+            "all messages should carry the forked file's own session id; got {:?}",
+            messages
+                .iter()
+                .map(|m| m.session_id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn turn_context_line(timestamp: &str, cwd: &str) -> Value {
+        json!({
+            "timestamp": timestamp,
+            "type": "turn_context",
+            "payload": { "turn_id": "turn-1", "cwd": cwd, "model": "gpt-5" }
+        })
+    }
+
+    fn write_rollout_lines(dir: &Path, file_name: &str, lines: &[Value]) -> std::path::PathBuf {
+        let rollout_path = dir.join(file_name);
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{body}\n")).expect("rollout fixture should be written");
+        rollout_path
+    }
+
+    #[test]
+    #[serial]
+    fn search_prioritizes_conversation_text_over_tool_matches() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let sessions_dir = tmp.path().join("sessions/2026/08/13");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+
+        let mut lines = vec![session_meta_line_with(
+            "2026-08-13T08:00:00Z",
+            "sess-wallpaper",
+            "/tmp/windows_remote_dev",
+        )];
+        for index in 0..101 {
+            lines.push(json!({
+                "timestamp": format!("2026-08-13T08:00:{:02}Z", index % 60),
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "id": format!("tool-{index}"),
+                    "call_id": format!("call-{index}"),
+                    "name": "exec_command",
+                    "arguments": json!({ "cmd": format!("rg wallpaper file-{index}") }).to_string()
+                }
+            }));
+        }
+        lines.push(user_message_line(
+            "2026-08-13T09:00:00Z",
+            "Please diagnose the Windows wallpaper problem.",
+        ));
+        write_rollout_lines(
+            &sessions_dir,
+            "rollout-2026-08-13T08-00-00-sess-wallpaper.jsonl",
+            &lines,
+        );
+
+        let _guard = EnvVarGuard::set("CODEX_HOME", tmp.path());
+        let results = search("wallpaper", 1, &json!({})).expect("Codex search should succeed");
+
+        assert_eq!(results.len(), 1);
+        assert!(crate::utils::search_message_text_case_insensitive(
+            &results[0],
+            "wallpaper"
+        ));
+        assert_eq!(results[0].message_type, "user");
+        assert_eq!(
+            results[0].project_name.as_deref(),
+            Some("windows_remote_dev")
+        );
+    }
+
+    #[test]
+    fn search_prefilter_matches_ascii_case_insensitively() {
+        assert!(bytes_contain_query_case_insensitive(
+            br#"{"text":"Windows Wallpaper Engine"}"#,
+            b"wallpaper"
+        ));
+        assert!(bytes_contain_query_case_insensitive(
+            br#"{"text":"WALLPAPER"}"#,
+            b"wallpaper"
+        ));
+        assert!(!bytes_contain_query_case_insensitive(
+            br#"{"text":"window manager"}"#,
+            b"wallpaper"
+        ));
+    }
+
+    #[test]
+    fn search_prefilter_matches_json_escaped_text() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = tmp.path().join("rollout-escaped.jsonl");
+        fs::write(
+            &rollout_path,
+            concat!(
+                r#"{"timestamp":"2026-08-13T08:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"\u0077allpaper"}]}}"#,
+                "\n"
+            ),
+        )
+        .expect("rollout should be written");
+
+        assert!(rollout_might_contain_query(&rollout_path, "wallpaper"));
+    }
+
+    #[test]
+    #[serial]
+    fn search_ignores_developer_instruction_matches() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let sessions_dir = tmp.path().join("sessions/2026/08/13");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+        write_rollout_lines(
+            &sessions_dir,
+            "rollout-2026-08-13T08-00-00-developer-only.jsonl",
+            &[
+                session_meta_line_with(
+                    "2026-08-13T08:00:00Z",
+                    "sess-developer-only",
+                    "/tmp/project",
+                ),
+                json!({
+                    "timestamp": "2026-08-13T08:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "Internal wallpaper instruction"
+                        }]
+                    }
+                }),
+                user_message_line("2026-08-13T08:00:02Z", "A different question"),
+            ],
+        );
+
+        let _guard = EnvVarGuard::set("CODEX_HOME", tmp.path());
+        let results = search("wallpaper", 100, &json!({})).expect("Codex search should succeed");
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn search_applies_role_and_project_filters_before_limit() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let sessions_dir = tmp.path().join("sessions/2026/08/13");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory should be created");
+
+        write_rollout_lines(
+            &sessions_dir,
+            "rollout-2026-08-13T08-00-00-selected.jsonl",
+            &[
+                session_meta_line_with(
+                    "2026-08-13T08:00:00Z",
+                    "sess-selected",
+                    "/tmp/windows_remote_dev",
+                ),
+                user_message_line(
+                    "2026-08-13T08:00:01Z",
+                    "The selected wallpaper conversation.",
+                ),
+            ],
+        );
+        write_rollout_lines(
+            &sessions_dir,
+            "rollout-2026-08-13T09-00-00-newer.jsonl",
+            &[
+                session_meta_line_with("2026-08-13T09:00:00Z", "sess-newer", "/tmp/other_project"),
+                json!({
+                    "timestamp": "2026-08-13T09:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "A newer wallpaper conversation."
+                        }]
+                    }
+                }),
+            ],
+        );
+
+        let _guard = EnvVarGuard::set("CODEX_HOME", tmp.path());
+        let filters = json!({
+            "messageType": "user",
+            "projects": ["windows_remote_dev"]
+        });
+        let results = search("wallpaper", 1, &filters).expect("Codex search should succeed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session_id, "sess-selected");
+        assert_eq!(results[0].message_type, "user");
+        assert_eq!(
+            results[0].project_name.as_deref(),
+            Some("windows_remote_dev")
+        );
+    }
+
+    #[test]
+    /// Newer Codex builds can leave rollouts with no `session_meta` line at
+    /// all (issue #451 follow-up). Identity must then come from fallbacks:
+    /// cwd from the LAST `turn_context` (a fork replays the source's turn
+    /// contexts first, so the last one is where the session actually runs)
+    /// and the session id from the rollout filename.
+    fn extract_session_info_falls_back_when_rollout_has_no_session_meta() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = write_rollout_lines(
+            tmp.path(),
+            "rollout-2026-07-09T10-00-00-019cf000-aaaa-7000-8000-f986e7b4c56a.jsonl",
+            &[
+                turn_context_line("2026-07-09T10:00:00Z", "/tmp/proj-a"),
+                user_message_line("2026-07-09T10:00:01Z", "replayed from the source session"),
+                turn_context_line("2026-07-09T10:00:02Z", "/tmp/proj-b"),
+                user_message_line("2026-07-09T10:00:03Z", "continue in the fork's folder"),
+            ],
+        );
+
+        let info = extract_session_info(&rollout_path).expect("extract_session_info");
+        assert_eq!(info.cwd.as_deref(), Some("/tmp/proj-b"));
+        assert_eq!(info.session_id, "019cf000-aaaa-7000-8000-f986e7b4c56a");
+
+        let cwd = extract_session_cwd(&rollout_path).expect("extract_session_cwd");
+        assert_eq!(cwd.as_deref(), Some("/tmp/proj-b"));
+    }
+
+    #[test]
+    /// `session_meta`, when present, still wins over any `turn_context` fallback.
+    fn extract_session_info_prefers_session_meta_over_turn_context() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = write_rollout_lines(
+            tmp.path(),
+            "rollout-2026-07-09T10-00-00-019cf000-bbbb-7000-8000-f986e7b4c56a.jsonl",
+            &[
+                session_meta_line_with("2026-07-09T10:00:00Z", "sess-meta", "/tmp/proj-meta"),
+                turn_context_line("2026-07-09T10:00:01Z", "/tmp/proj-turn"),
+                user_message_line("2026-07-09T10:00:02Z", "hello"),
+            ],
+        );
+
+        let info = extract_session_info(&rollout_path).expect("extract_session_info");
+        assert_eq!(info.cwd.as_deref(), Some("/tmp/proj-meta"));
+        assert_eq!(info.session_id, "sess-meta");
+        assert_eq!(
+            extract_session_cwd(&rollout_path).unwrap().as_deref(),
+            Some("/tmp/proj-meta")
+        );
+    }
+
+    #[test]
+    /// Messages in a meta-less rollout carry the filename-derived session id.
+    fn parse_rollout_file_uses_filename_session_id_without_meta() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let rollout_path = write_rollout_lines(
+            tmp.path(),
+            "rollout-2026-07-09T10-00-00-019cf000-cccc-7000-8000-f986e7b4c56a.jsonl",
+            &[
+                turn_context_line("2026-07-09T10:00:00Z", "/tmp/proj-b"),
+                user_message_line("2026-07-09T10:00:01Z", "no meta anywhere"),
+            ],
+        );
+
+        let messages = parse_rollout_file(&rollout_path).expect("parse_rollout_file");
+        assert!(!messages.is_empty());
+        assert!(messages
+            .iter()
+            .all(|m| m.session_id == "019cf000-cccc-7000-8000-f986e7b4c56a"));
+    }
+
+    #[test]
+    /// Codex compresses old rollouts to `.jsonl.zst`; they must stay
+    /// discoverable and parseable, and a compressed file whose plain twin
+    /// exists must be skipped (the plain one is the materialized, current
+    /// version).
+    fn compressed_rollouts_are_discovered_and_parsed() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+
+        let lines = [
+            session_meta_line_with("2026-07-09T10:00:00Z", "sess-zst", "/tmp/proj-z"),
+            user_message_line("2026-07-09T10:00:01Z", "hello from a compressed rollout"),
+        ];
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compressed = zstd::encode_all(body.as_bytes(), 3).expect("zstd encode");
+        let zst_path = tmp
+            .path()
+            .join("rollout-2026-07-09T10-00-00-019cf000-dddd-7000-8000-f986e7b4c56a.jsonl.zst");
+        fs::write(&zst_path, compressed).expect("write zst fixture");
+
+        assert!(is_rollout_jsonl(&zst_path));
+        assert!(is_discoverable_rollout(&zst_path));
+
+        let info = extract_session_info(&zst_path).expect("extract_session_info on zst");
+        assert_eq!(info.session_id, "sess-zst");
+        assert_eq!(info.cwd.as_deref(), Some("/tmp/proj-z"));
+
+        let messages = parse_rollout_file(&zst_path).expect("parse zst rollout");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "sess-zst");
+
+        // Once the plain twin exists, the compressed copy is no longer listed.
+        let plain_path = zst_path.with_extension("");
+        fs::write(&plain_path, format!("{body}\n")).expect("write plain twin");
+        assert!(!is_discoverable_rollout(&zst_path));
+        assert!(is_discoverable_rollout(&plain_path));
+    }
+
+    #[test]
+    /// Filename-derived session ids also work for compressed rollouts, whose
+    /// `file_stem` still carries a ".jsonl" tail.
+    fn session_id_from_rollout_filename_handles_zst() {
+        assert_eq!(
+            session_id_from_rollout_filename(Path::new(
+                "rollout-2026-07-09T10-00-00-019cf000-eeee-7000-8000-f986e7b4c56a.jsonl.zst"
+            )),
+            Some("019cf000-eeee-7000-8000-f986e7b4c56a".to_string())
+        );
+        assert_eq!(
+            session_id_from_rollout_filename(Path::new("rollout-short.jsonl")),
+            None
+        );
+    }
+}

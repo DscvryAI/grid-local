@@ -1,0 +1,63 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Grid Local",
+  "version": "0.1.0",
+  "identifier": "com.dscvry.grid-local",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build"
+  },
+  "app": {
+    "windows": [
+      {
+        "titleBarStyle": "Overlay",
+        "label": "main",
+        "title": "",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 380,
+        "minHeight": 400,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "visible": true,
+        "focus": true,
+        "zoomHotkeysEnabled": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'",
+      "capabilities": [
+        "default"
+      ]
+    }
+  },
+  "plugins": {
+    "updater": {
+      "active": false,
+      "endpoints": [],
+      "dialog": false,
+      "pubkey": ""
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": false,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "signingIdentity": null,
+      "hardenedRuntime": true,
+      "minimumSystemVersion": "10.13",
+      "entitlements": "entitlements.plist"
+    }
+  }
+}

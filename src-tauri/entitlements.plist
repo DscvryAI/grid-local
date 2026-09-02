@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Production-readiness check (2026-09-02): required for the bundled
+       WKWebView to run under macOS's hardened runtime (already enabled
+       via tauri.conf.json's bundle.macOS.hardenedRuntime). Grid Local
+       does not use Apple's App Sandbox, so no com.apple.security.app-sandbox
+       or folder-scope entitlements are needed -- its file access relies on
+       the standard macOS permission prompts (TCC), not sandbox entitlements.
+       Inert on this Windows dev machine; not verified on a real Mac. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>

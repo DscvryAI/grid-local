@@ -1,0 +1,127 @@
+/**
+ * Core Session Types
+ *
+ * Project and session structures for Claude conversation organization.
+ */
+
+// ============================================================================
+// Provider Types
+// ============================================================================
+
+export type ProviderId = "aider" | "amazonq" | "antigravity" | "claude" | "cline" | "codebuddy" | "codex" | "continue" | "copilot" | "crush" | "cursor" | "cursor-agent" | "forgecode" | "gemini" | "goose" | "grok" | "kimi" | "kiro" | "llm" | "ompi" | "opencode" | "openhands" | "openinterpreter" | "pearai" | "pi" | "qwen" | "trae" | "vibe" | "zed";
+
+export interface ProviderInfo {
+  id: ProviderId;
+  display_name: string;
+  base_path: string;
+  is_available: boolean;
+}
+
+/** Mirrors `src-tauri/src/models/provider.rs::ProviderTier`. `tier` is the
+ * raw internal letter ("A"/"B") -- never render it directly, translate it
+ * into user-facing wording (see `ProvidersMenuGroup`'s own coverage-label
+ * mapping). */
+export interface ProviderTier {
+  provider_key: string;
+  tier: string;
+}
+
+// ============================================================================
+// Git Types
+// ============================================================================
+
+export type GitWorktreeType = "main" | "linked" | "not_git";
+
+export interface GitInfo {
+  /** 워크트리 유형 */
+  worktree_type: GitWorktreeType;
+  /** 메인 레포의 프로젝트 경로 (링크드 워크트리인 경우) */
+  main_project_path?: string;
+}
+
+export interface GitCommit {
+  hash: string;
+  author: string;
+  date: string;
+  message: string;
+  timestamp: number;
+}
+
+// ============================================================================
+// Project & Session
+// ============================================================================
+
+/** The last-known project path no longer exists on this machine. */
+export type ProjectPathStatus = "unavailable";
+
+export interface ClaudeProject {
+  name: string;
+  /** Claude session storage path (e.g., "~/.claude/projects/-Users-jack-client-my-project") */
+  path: string;
+  /** Decoded actual filesystem path (e.g., "/Users/jack/client/my-project") */
+  actual_path: string;
+  session_count: number;
+  message_count: number;
+  last_modified: string;
+  /** Path-dependent actions are unavailable while the last-known path is missing. */
+  path_status?: ProjectPathStatus;
+  /** Git worktree 정보 */
+  git_info?: GitInfo;
+  /** Provider identifier (claude, codex, opencode) */
+  provider?: ProviderId;
+  /** Storage type (json, jsonl, sqlite) */
+  storage_type?: "json" | "jsonl" | "sqlite";
+  /** Label for custom Claude directory source (e.g., "Personal") */
+  custom_directory_label?: string;
+}
+
+export interface ClaudeSession {
+  session_id: string; // Unique ID based on file path
+  actual_session_id: string; // Actual session ID from the messages
+  file_path: string; // JSONL file full path
+  project_name: string;
+  message_count: number;
+  first_message_time: string;
+  last_message_time: string;
+  last_modified: string; // File last modified time
+  has_tool_use: boolean;
+  has_errors: boolean;
+  summary?: string;
+  /** Whether this session was explicitly renamed via the /rename command */
+  is_renamed?: boolean;
+  relevance?: number;
+  /** Provider identifier (claude, codex, opencode) */
+  provider?: ProviderId;
+  /** Storage type (json, jsonl, sqlite) */
+  storage_type?: "json" | "jsonl" | "sqlite";
+  /**
+   * Originating client/surface for the session. Raw value from the JSONL
+   * `entrypoint` field. Known values:
+   *   * Claude:  "cli" / "claude-vscode" / "claude-desktop"
+   *   * Copilot: "copilot-cli" / "copilot-desktop" / "copilot-vscode"
+   * Undefined for providers that don't stamp the field, or older sessions.
+   */
+  entrypoint?: string;
+}
+
+export interface SessionPage {
+  sessions: ClaudeSession[];
+  total: number;
+  offset: number;
+  limit: number;
+  nextOffset: number;
+  hasMore: boolean;
+}
+
+// ============================================================================
+// Search Filters
+// ============================================================================
+
+export interface SearchFilters {
+  dateRange?: [Date, Date];
+  projects?: string[];
+  messageType?: "user" | "assistant" | "all";
+  hasToolCalls?: boolean;
+  hasErrors?: boolean;
+  hasFileChanges?: boolean;
+}
