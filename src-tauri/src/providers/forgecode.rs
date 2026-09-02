@@ -1673,8 +1673,8 @@ mod tests {
     ///
     /// Use this instead of manual save / set / restore blocks so that the
     /// original value is put back even if an assertion in the test panics.
-    /// Tests in this module rely on `--test-threads=1` (see `CLAUDE.md`
-    /// "Phase 1: Quality Gate") because env vars are global to the process.
+    /// Tests in this module rely on `--test-threads=1` because env vars
+    /// are global to the process.
     ///
     /// `original` is stored as `OsString` rather than `String` so that
     /// non-UTF-8 values (legitimate on macOS / Linux) are restored

@@ -44,6 +44,10 @@ pnpm tauri:build
   data by design (see `README.md`). Changes that would have it write
   to, modify, or transmit data from other tools' storage need a strong
   justification and explicit discussion first.
+- Commit messages should describe the change on its own terms. Please
+  don't add AI-attribution trailers (e.g. `Co-Authored-By: <AI tool>`)
+  to commits in this repository, regardless of what tooling you used
+  to help write the change.
 
 ## Reporting bugs
 
