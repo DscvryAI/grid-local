@@ -1,0 +1,47 @@
+name: Release
+
+# Builds installers and creates a draft GitHub Release whenever a
+# version tag (v*) is pushed. Draft, not auto-published -- review the
+# generated release notes and assets before publishing.
+#
+# No code-signing keys exist yet (TAURI_SIGNING_PRIVATE_KEY unset), so
+# installers built here are unsigned, same as a local build. Windows
+# SmartScreen / macOS Gatekeeper will warn on first run until that
+# changes.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "windows-latest"
+          - platform: "macos-latest"
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Grid Local ${{ github.ref_name }}"
+          releaseBody: "See CHANGELOG.md for details."
+          releaseDraft: true
+          prerelease: false
