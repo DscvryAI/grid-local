@@ -6313,7 +6313,7 @@ mod tests {
     }
 
     /// Antigravity CLI shares `StatsProvider::Antigravity` with the desktop
-    /// app (see providers::antigravity_cli's module docs), but its sessions
+    /// app (see `providers::antigravity_cli`'s module docs), but its sessions
     /// carry no external usage-log file, so the bespoke desktop stats logic
     /// (keyed to that file) always found zero records for CLI sessions and
     /// silently returned an empty summary. This must route through the

@@ -288,10 +288,10 @@ fn compute_facets(
     }
 
     let mut available_projects: Vec<_> = projects.into_values().collect();
-    available_projects.sort_by(|a, b| b.session_count.cmp(&a.session_count));
+    available_projects.sort_by_key(|a| std::cmp::Reverse(a.session_count));
 
     let mut available_providers: Vec<_> = providers.into_values().collect();
-    available_providers.sort_by(|a, b| b.session_count.cmp(&a.session_count));
+    available_providers.sort_by_key(|a| std::cmp::Reverse(a.session_count));
 
     let mut available_models: Vec<_> = models.into_iter().collect();
     available_models.sort();

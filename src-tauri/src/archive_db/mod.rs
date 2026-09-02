@@ -285,7 +285,7 @@ mod tests {
         ) -> std::collections::HashMap<std::path::PathBuf, std::time::SystemTime> {
             walkdir::WalkDir::new(root)
                 .into_iter()
-                .filter_map(|e| e.ok())
+                .filter_map(std::result::Result::ok)
                 .filter(|e| e.file_type().is_file())
                 .map(|e| (e.path().to_path_buf(), e.metadata().unwrap().modified().unwrap()))
                 .collect()
@@ -305,14 +305,14 @@ mod tests {
 
         let before = file_mtimes(home.path());
 
-        let _restore = RestoreHome(std::env::var_os("HOME"));
+        let restore = RestoreHome(std::env::var_os("HOME"));
         std::env::set_var("HOME", home.path());
 
         let mut conn = Connection::open_in_memory().unwrap();
         migrate::migrate(&mut conn).unwrap();
         let result =
             ingest::ingest_claude_project(&mut conn, &project_dir.to_string_lossy()).await;
-        drop(_restore);
+        drop(restore);
         result.unwrap();
 
         let after = file_mtimes(home.path());
